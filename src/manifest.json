@@ -1,0 +1,24 @@
+{
+  "menu": {
+    "index": {
+      "label": "DNS Bind",
+      "order": 75,
+      "keywords": [
+        {
+          "matches": [
+            "dns",
+            "bind",
+            "named",
+            "zone",
+            "zones",
+            "forwarder",
+            "resolver"
+          ]
+        }
+      ]
+    }
+  },
+  "requires": {
+    "superuser": true
+  }
+}

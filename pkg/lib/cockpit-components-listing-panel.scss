@@ -1,0 +1,53 @@
+.ct-listing-panel {
+  display: flex;
+  flex-wrap: wrap;
+
+  &-actions {
+    order: 2;
+    flex-grow: 1;
+    padding-block: var(--pf-t--global--spacer--sm);
+    padding-inline: var(--pf-t--global--spacer--md) var(--pf-t--global--spacer--lg);
+  }
+
+  &-caption {
+    margin-inline-start: auto;
+  }
+
+  &-tabs {
+    flex-grow: 1;
+    order: 1;
+  }
+
+  .pf-v6-c-tab-content {
+    order: 3;
+    flex-basis: 100%;
+  }
+
+  &-body {
+    // Add some sizing to the body
+    padding-block: var(--pf-t--global--spacer--md);
+    padding-inline: var(--pf-t--global--spacer--lg);
+    inline-size: 100%;
+
+    // Containing hack part 1
+    float: inline-start;
+
+    &::after {
+      // Containing hack part 2: Clearfix CSS hack,
+      // to allow children content to float fine without setting overflow
+      content: "";
+      clear: both;
+      display: table;
+    }
+  }
+}
+
+.ct-table {
+  > tbody > .pf-v6-c-table__expandable-row {
+    // Don't scroll table's expanded contents vertically.
+    // Instead, rely on page scrolling.
+    // Important for mobile; also useful for desktop.
+    overflow-block: visible !important;
+    max-block-size: unset !important;
+  }
+}

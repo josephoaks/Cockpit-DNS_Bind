@@ -1,0 +1,14 @@
+extend = "../../pyproject.toml"
+
+# Tests run under the tasks container with Python 3.13
+target-version = "py313"
+
+[lint]
+ignore = [
+    "E501",     # https://github.com/charliermarsh/ruff/issues/3206#issuecomment-1562681390
+
+    "B010",     # Do not call `setattr` with a constant attribute value. It is not any safer than normal property access.
+    "FBT001",   # Boolean positional arg in function definition
+    "FBT002",   # Boolean default value in function definition
+    "PT009",    # Use a regular `assert` instead of unittest-style `assertEqual`
+]

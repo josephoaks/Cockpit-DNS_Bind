@@ -1,0 +1,40 @@
+// FIXME: Remove this custom implementation once a component exists upstream.
+// PF overrides to fake a multiselect widget (as one does not currently exist in PF4).
+// A menu gives us the interaction we want, but the styling is a bit off.
+// Therefore, we're changing the visuals here locally.
+// PF4 upstream request for multi-select @ https://github.com/patternfly/patternfly/issues/4027
+.ct-menu-select-widget.pf-v6-c-menu {
+  /* PF rounds the element, but it doesn't have a borderr or background;
+  we don't want to clip it in children elements */
+  border-radius: var(--pf-t--global--border--radius--0);
+
+  // Divider is silly between the widgets in this context
+  .pf-v6-c-divider {
+    display: none;
+
+    + .pf-v6-c-menu__content {
+      // There should be minimal space between the widgets (replacing the divider)
+      margin-block-start: var(--pf-t--global--spacer--sm);
+    }
+  }
+
+  .pf-v6-c-menu__content {
+    // An overflow multi-select widget needs an outline
+    border: var(--pf-t--global--border--width--100) solid var(--pf-t--global--border--color--default);
+    border-radius: var(--pf-t--global--border--radius--small);
+  }
+
+  // Search should not be inset when there's no border containing it
+  .pf-v6-c-menu__search {
+    padding: 0;
+  }
+
+  // Keep the background on a selected item even when it doesn't have
+  // focus, allowing keyboard control to have the only background color
+  // when active but also keep the background color when the list loses
+  // focus (such as when the keyboard or mouse navigates outside,
+  // including initial rendering of the list.
+  .pf-v6-c-menu__list:not(:focus-within) .pf-m-selected {
+    background-color: var(--pf-v6-c-menu__list-item--hover--BackgroundColor);
+  }
+}
