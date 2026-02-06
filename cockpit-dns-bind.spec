@@ -11,7 +11,7 @@ Release:        1%{?dist}
 Summary:        Cockpit plugin for managing BIND DNS server
 License:        LGPL-2.1
 URL:            https://github.com/josephoaks/Cockpit-DNS_Bind
-Source0:        cockpit-dns-bind-%{version}.tar.xz
+Source0:        cockpit-dns-bind-%{version}.tar.gz
 BuildArch:      noarch
 Requires:       cockpit
 Requires:       bind
