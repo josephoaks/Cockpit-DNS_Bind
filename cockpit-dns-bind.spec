@@ -31,7 +31,8 @@ Linux distributions.
 # Nothing to build, tarball includes pre-built dist/
 
 %install
-%make_install PREFIX=/usr
+mkdir -p %{buildroot}/usr/share/cockpit
+cp -a dns-bind %{buildroot}/usr/share/cockpit/
 
 %files
 %license LICENSE
