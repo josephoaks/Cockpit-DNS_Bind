@@ -37,6 +37,11 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
   const [recordName, setRecordName] = useState('');
   const [recordType, setRecordType] = useState('A');
   const [recordValue, setRecordValue] = useState('');
+  const [createPtr, setCreatePtr] = useState(true);
+
+  // Records table sorting
+  const [recordSortField, setRecordSortField] = useState('name');
+  const [recordSortDir, setRecordSortDir] = useState('asc');
 
   // Basics tab state
   const [allowDynamicUpdates, setAllowDynamicUpdates] = useState(false);
@@ -141,12 +146,27 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
     setActiveTabKey(tabIndex);
   };
 
+  // Records table sorting helpers
+  const toggleRecordSort = (field) => {
+    if (recordSortField === field) {
+      setRecordSortDir(recordSortDir === 'asc' ? 'desc' : 'asc');
+    } else {
+      setRecordSortField(field);
+      setRecordSortDir('asc');
+    }
+  };
+  const recordSortIndicator = (field) =>
+    recordSortField === field ? (recordSortDir === 'asc' ? ' \u25B2' : ' \u25BC') : '';
+  const recordAriaSort = (field) =>
+    recordSortField === field ? (recordSortDir === 'asc' ? 'ascending' : 'descending') : 'none';
+
   // A/AAAA/CNAME Record handlers
   const handleAddRecord = () => {
     setEditingRecord(null);
     setRecordName('');
     setRecordType('A');
     setRecordValue('');
+    setCreatePtr(true);
     setIsRecordModalOpen(true);
   };
 
@@ -205,7 +225,8 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
           zone: zone.name,
           name: recordName,
           type: recordType,
-          value: recordValue
+          value: recordValue,
+          createReverse: (recordType === 'A' || recordType === 'AAAA') ? createPtr : false
         };
         const output = await spawnBackend(['add-record', JSON.stringify(data)]);
         const result = JSON.parse(output);
@@ -213,6 +234,10 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
         if (result.error) {
           setError('Failed to add record: ' + result.error);
           return;
+        }
+        // Reverse (PTR) was requested but couldn't be created cleanly — let the user know.
+        if (result.ptr && result.ptr.status !== 'created') {
+          alert(result.ptr.message);
         }
       }
 
@@ -836,19 +861,37 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
               </ToolbarContent>
             </Toolbar>
 
-            {zoneData?.records && (
-              <table className="pf-v6-c-table pf-m-compact" role="grid">
+	  {zoneData?.records && (
+              <div style={{ maxHeight: 'calc(100vh - 22rem)', overflow: 'auto' }}>
+              <table className="pf-v6-c-table pf-m-compact pf-m-sticky-header" role="grid">
                 <thead>
                   <tr role="row">
-                    <th role="columnheader" scope="col">Record Key</th>
-                    <th role="columnheader" scope="col">Type</th>
-                    <th role="columnheader" scope="col">Value</th>
+                    <th role="columnheader" scope="col" aria-sort={recordAriaSort('name')}
+                        style={{ cursor: 'pointer', userSelect: 'none' }}
+                        onClick={() => toggleRecordSort('name')}>
+                      Record Key{recordSortIndicator('name')}
+                    </th>
+                    <th role="columnheader" scope="col" aria-sort={recordAriaSort('type')}
+                        style={{ cursor: 'pointer', userSelect: 'none' }}
+                        onClick={() => toggleRecordSort('type')}>
+                      Type{recordSortIndicator('type')}
+                    </th>
+                    <th role="columnheader" scope="col" aria-sort={recordAriaSort('value')}
+                        style={{ cursor: 'pointer', userSelect: 'none' }}
+                        onClick={() => toggleRecordSort('value')}>
+                      Value{recordSortIndicator('value')}
+                    </th>
                     <th role="columnheader" scope="col"></th>
                   </tr>
                 </thead>
                 <tbody role="rowgroup">
-                  {zoneData.records.map((record, idx) => (
-                    <tr key={idx} role="row">
+                  {[...zoneData.records].sort((a, b) => {
+                    const dir = recordSortDir === 'asc' ? 1 : -1;
+                    const av = (a[recordSortField] ?? '').toString();
+                    const bv = (b[recordSortField] ?? '').toString();
+                    return dir * av.localeCompare(bv, undefined, { numeric: true, sensitivity: 'base' });
+                  }).map((record, idx) => (
+                    <tr key={`${record.name}-${record.type}-${record.value}-${idx}`} role="row">
                       <td role="cell">{record.name}</td>
                       <td role="cell">{record.type}</td>
                       <td role="cell">{record.value}</td>
@@ -864,6 +907,7 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
                   ))}
                 </tbody>
               </table>
+              </div>
             )}
           </div>
         </Tab>
@@ -906,6 +950,17 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
                 placeholder="192.168.1.1"
               />
             </FormGroup>
+            {!editingRecord && (recordType === 'A' || recordType === 'AAAA') && (
+              <FormGroup fieldId="record-create-ptr">
+                <Checkbox
+                  id="record-create-ptr"
+                  label="Also create reverse (PTR) record"
+                  description="Adds a matching PTR in the hosted in-addr.arpa/ip6.arpa zone, if one exists. Skipped safely when no reverse zone is present or a PTR for this address already exists."
+                  isChecked={createPtr}
+                  onChange={(event, checked) => setCreatePtr(checked)}
+                />
+              </FormGroup>
+            )}
           </Form>
         </ModalBody>
         <ModalFooter>

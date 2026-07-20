@@ -6,7 +6,7 @@
 # License: LGPL-2.1
 #
 Name:           cockpit-dns-bind
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Cockpit plugin for managing BIND DNS server
 License:        LGPL-2.1
@@ -40,6 +40,12 @@ cp -a dns-bind %{buildroot}/usr/share/cockpit/
 /usr/share/cockpit/dns-bind
 
 %changelog
+* Mon Jul 20 2026 Joseph Oaks
+- Fixed DNS Record TYPE parsing to include (AAAA, CNAME, TXT, PTR)
+  and others that were missing. This was found due to an upgrade
+  from Leap 15.6 to Leap 16, so an existing zone with records.
+-Added sort and scroll to the Records.
+-Added checkbox for adding of PTR records for reverse table.
 * Thu Feb 05 2026 Joseph Oaks
 - Initial RPM packaging for dns-bind
 - Zone management interface

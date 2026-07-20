@@ -7,6 +7,7 @@ Reads and parses BIND zone files
 import json
 import sys
 import re
+import ipaddress
 from pathlib import Path
 from datetime import datetime
 
@@ -134,25 +135,40 @@ def delete_zone(zone_name):
   return {"success": True, "zone": zone_name}
 
 
+def _extract_block(content, start_brace):
+  """Given index of an opening brace, return (block_text, index_after_matching_close)."""
+  depth = 0
+  i = start_brace
+  n = len(content)
+  while i < n:
+    c = content[i]
+    if c == '{':
+      depth += 1
+    elif c == '}':
+      depth -= 1
+      if depth == 0:
+        return content[start_brace + 1:i], i + 1
+    i += 1
+  return content[start_brace + 1:], n  # unbalanced; best effort
+
+
 def parse_named_conf(conf_file):
-  """Parse named.conf to extract zone definitions"""
+  """Parse named.conf to extract zone definitions (nested-brace safe)."""
   zones = []
 
   with open(conf_file, 'r') as f:
     content = f.read()
 
-  # Match zone definitions: zone "name" in { ... } or zone "name" { ... }
-  zone_pattern = r'zone\s+"([^"]+)"\s+(?:in\s+)?\{([^}]+)\}'
+  header = re.compile(r'zone\s+"([^"]+)"\s+(?:in\s+)?\{', re.IGNORECASE)
 
-  for match in re.finditer(zone_pattern, content, re.IGNORECASE | re.DOTALL):
-    zone_name = match.group(1)
-    zone_block = match.group(2)
+  for m in header.finditer(content):
+    zone_name = m.group(1)
+    brace_idx = m.end() - 1
+    zone_block, _ = _extract_block(content, brace_idx)
 
-    # Extract type (master/slave/primary/secondary)
-    type_match = re.search(r'type\s+(master|slave|primary|secondary|forward|hint)', zone_block, re.IGNORECASE)
+    type_match = re.search(r'type\s+(master|slave|primary|secondary|forward|hint)',
+                           zone_block, re.IGNORECASE)
     zone_type = type_match.group(1).capitalize() if type_match else "Primary"
-
-    # Normalize type names
     if zone_type.lower() == "master":
       zone_type = "Primary"
     elif zone_type.lower() == "slave":
@@ -160,20 +176,13 @@ def parse_named_conf(conf_file):
     elif zone_type.lower() == "hint":
       zone_type = "Hint"
 
-    # Extract file path (with or without quotes)
-    file_match = re.search(r'file\s+["\']?([^"\';\s]+)["\']?', zone_block)
+    q = chr(34) + chr(39)  # " and '
+    file_match = re.search(r'file\s+[' + q + r']?([^' + q + r';\s]+)[' + q + r']?', zone_block)
     zone_file = file_match.group(1) if file_match else None
+    if zone_file and not zone_file.startswith('/'):
+      zone_file = f"{ZONES_BASE}/{zone_file}"
 
-    # Build full path
-    if zone_file:
-      if not zone_file.startswith('/'):
-        zone_file = f"{ZONES_BASE}/{zone_file}"
-
-    zones.append({
-      "name": zone_name,
-      "type": zone_type,
-      "file": zone_file
-    })
+    zones.append({"name": zone_name, "type": zone_type, "file": zone_file})
 
   return zones
 
@@ -220,70 +229,111 @@ def parse_ttl(zone_file):
   return None
 
 
-def read_zone_records(zone_file):
-  """Read and parse DNS records from a zone file"""
-  if not zone_file or not Path(zone_file).exists():
-    return []
 
-  records = []
+_RR_CLASSES = {"IN", "CH", "HS", "CS"}
+_GENERAL_TYPES = {"A", "AAAA", "CNAME", "TXT", "PTR", "SRV", "CAA", "NAPTR", "DNAME", "SPF"}
 
+
+def _strip_comment(line):
+  """Remove a trailing ; comment, honoring double-quoted strings (TXT)."""
+  out = []
+  in_q = False
+  for ch in line:
+    if ch == chr(34):
+      in_q = not in_q
+    if ch == ';' and not in_q:
+      break
+    out.append(ch)
+  return "".join(out)
+
+
+def _looks_like_ttl(tok):
+  return re.fullmatch(r'\d+[smhdwSMHDW]?', tok) is not None
+
+
+def _logical_records(zone_file):
+  """Yield (had_leading_ws, text) per logical RR, joining ()-continuations."""
   with open(zone_file, 'r') as f:
-    for line in f:
-      line = line.strip()
+    raw = f.read().splitlines()
 
-      # Skip comments and empty lines
-      if not line or line.startswith(';') or line.startswith('$'):
+  buf, had_ws, depth = "", False, 0
+  for line in raw:
+    text = _strip_comment(line)
+    if depth == 0:
+      if text.strip() == "":
         continue
+      had_ws = text[:1].isspace()
+      buf = text
+    else:
+      buf += " " + text.strip()
+    depth += text.count("(") - text.count(")")
+    if depth <= 0:
+      depth = 0
+      merged = buf.replace("(", " ").replace(")", " ").strip()
+      if merged:
+        yield had_ws, merged
+      buf = ""
 
-      # Skip SOA records (too complex for now)
-      if 'SOA' in line or line.startswith('@'):
-        continue
 
-      # Parse A records (basic for now)
-      # Format: hostname IN A ip_address
-      match = re.match(r'^(\S+)\s+IN\s+A\s+(\S+)', line)
-      if match:
-        hostname = match.group(1)
-        ip_address = match.group(2)
-        records.append({
-          "name": hostname,
-          "type": "A",
-          "value": ip_address
-        })
+def _iter_rrs(zone_file):
+  """Yield dicts: name, ttl, rrclass, type, value."""
+  if not zone_file or not Path(zone_file).exists():
+    return
+  last_owner = "@"
+  origin = None
+  for had_ws, text in _logical_records(zone_file):
+    if text.startswith('$'):
+      parts = text.split()
+      if len(parts) >= 2 and parts[0].upper() == "$ORIGIN":
+        origin = parts[1]
+      continue
+    toks = text.split()
+    if not toks:
+      continue
+    if had_ws:
+      owner = last_owner
+      idx = 0
+    else:
+      owner = toks[0]
+      idx = 1
+    last_owner = owner
+    ttl = rrclass = None
+    while idx < len(toks):
+      t = toks[idx]
+      if rrclass is None and t.upper() in _RR_CLASSES:
+        rrclass = t.upper(); idx += 1; continue
+      if ttl is None and _looks_like_ttl(t):
+        ttl = t; idx += 1; continue
+      break
+    if idx >= len(toks):
+      continue
+    rtype = toks[idx].upper()
+    idx += 1
+    value = " ".join(toks[idx:]).strip()
+    disp = origin if (owner == "@" and origin) else owner
+    yield {"name": disp, "ttl": ttl, "rrclass": rrclass, "type": rtype, "value": value}
 
+
+def read_zone_records(zone_file):
+  """Read general DNS records (A, AAAA, CNAME, TXT, PTR, SRV, ...).
+  NS/MX/SOA are handled by their own readers/tabs and excluded here."""
+  records = []
+  for rr in _iter_rrs(zone_file):
+    if rr["type"] in _GENERAL_TYPES:
+      records.append({"name": rr["name"], "type": rr["type"], "value": rr["value"]})
   return records
 
 
 def read_mx_records(zone_file):
-  """Read MX records from a zone file"""
-  if not zone_file or not Path(zone_file).exists():
-    return []
-
+  """Read MX records from a zone file (owner-inheritance safe)."""
   mx_records = []
-
-  with open(zone_file, 'r') as f:
-    for line in f:
-      line = line.strip()
-
-      # Skip comments, empty lines, and directives
-      if not line or line.startswith(';') or line.startswith('$'):
-        continue
-      
-      # Skip SOA records specifically (not all @ lines)
-      if 'SOA' in line:
-        continue
-
-      match = re.match(r'^(\S+)\s+IN\s+MX\s+(\d+)\s+(\S+)', line)
-      if match:
-        hostname = match.group(1)
-        priority = int(match.group(2))
-        mailserver = match.group(3)
-        mx_records.append({
-          "name": hostname,
-          "priority": priority,
-          "mailserver": mailserver
-        })
-
+  for rr in _iter_rrs(zone_file):
+    if rr["type"] == "MX":
+      parts = rr["value"].split()
+      if len(parts) >= 2 and parts[0].isdigit():
+        mx_records.append({"name": rr["name"],
+                           "priority": int(parts[0]),
+                           "mailserver": parts[1]})
   return mx_records
 
 
@@ -360,7 +410,67 @@ def update_soa(zone_name, soa_data):
   return {"success": True}
 
 
-def add_record(zone_name, record_name, record_type, record_value):
+def _reverse_fqdn(ip_value):
+  """Return the reverse-DNS name for an IP (v4 or v6), or None if not an IP."""
+  try:
+    return ipaddress.ip_address(ip_value.strip()).reverse_pointer
+  except ValueError:
+    return None
+
+
+def _find_reverse_zone(reverse_fqdn, zones):
+  """Most-specific hosted in-addr.arpa/ip6.arpa zone that is a suffix of reverse_fqdn."""
+  rlabels = reverse_fqdn.lower().split('.')
+  best, best_len = None, -1
+  for z in zones:
+    zname = z.get('name', '').rstrip('.').lower()
+    if not (zname.endswith('in-addr.arpa') or zname.endswith('ip6.arpa')):
+      continue
+    zlabels = zname.split('.')
+    if len(zlabels) <= len(rlabels) and rlabels[-len(zlabels):] == zlabels:
+      if len(zlabels) > best_len:
+        best, best_len = z, len(zlabels)
+  return best
+
+
+def _ptr_owner(reverse_fqdn, zone_name):
+  """Label(s) of reverse_fqdn relative to the reverse zone origin (or '@')."""
+  rlabels = reverse_fqdn.split('.')
+  zlabels = zone_name.rstrip('.').split('.')
+  owner = rlabels[:len(rlabels) - len(zlabels)]
+  return '.'.join(owner) if owner else '@'
+
+
+def _fqdn_for(name, zone_name):
+  base = zone_name.rstrip('.')
+  if name.endswith('.'):
+    return name
+  if name == '@':
+    return base + '.'
+  return f"{name}.{base}."
+
+
+def _create_ptr_record(record_name, ip_value, forward_zone_name, zones):
+  """Best-effort PTR creation for an A/AAAA. Never raises; returns a status dict."""
+  rev = _reverse_fqdn(ip_value)
+  if not rev:
+    return {"status": "skipped", "message": f"{ip_value} is not a valid IP address; no PTR created"}
+  rzone = _find_reverse_zone(rev, zones)
+  if not rzone or not rzone.get('file') or not Path(rzone['file']).exists():
+    return {"status": "skipped", "message": f"No hosted reverse zone for {ip_value}; PTR not created"}
+  owner = _ptr_owner(rev, rzone['name'])
+  target = _fqdn_for(record_name, forward_zone_name)
+  for rr in _iter_rrs(rzone['file']):
+    if rr['type'] == 'PTR' and rr['name'].rstrip('.').lower() in (owner.lower(), rev.lower()):
+      return {"status": "exists",
+              "message": f"PTR for {ip_value} already exists ({rr['value']}); left unchanged"}
+  with open(rzone['file'], 'a') as f:
+    f.write(f"{owner}\tIN PTR\t{target}\n")
+  increment_serial(rzone['file'])
+  return {"status": "created", "message": f"PTR {owner} -> {target} added to {rzone['name']}"}
+
+
+def add_record(zone_name, record_name, record_type, record_value, create_ptr=False):
   """Add a DNS record to a zone file"""
   zones = read_zones()
   zone = next((z for z in zones if z['name'] == zone_name), None)
@@ -382,7 +492,10 @@ def add_record(zone_name, record_name, record_type, record_value):
   # Increment serial
   new_serial = increment_serial(zone_file)
 
-  return {"success": True, "serial": new_serial}
+  result = {"success": True, "serial": new_serial}
+  if create_ptr and record_type in ("A", "AAAA"):
+    result["ptr"] = _create_ptr_record(record_name, record_value, zone_name, zones)
+  return result
 
 
 def update_record(zone_name, old_record_name, new_record_name, record_type, record_value):
@@ -698,33 +811,12 @@ def update_zone_options(zone_name, options):
   return {"success": True}
 
 def read_ns_records(zone_file):
-  """Read NS records from a zone file"""
-  if not zone_file or not Path(zone_file).exists():
-    return []
-
+  """Read NS records from a zone file (owner-inheritance safe)."""
   ns_records = []
-
-  with open(zone_file, 'r') as f:
-    for line in f:
-      line = line.strip()
-
-      # Skip comments, empty lines, and directives
-      if not line or line.startswith(';') or line.startswith('$'):
-        continue
-
-      # Skip SOA records
-      if 'SOA' in line:
-        continue
-
-      match = re.match(r'^(\S+)\s+IN\s+NS\s+(\S+)', line)
-      if match:
-        hostname = match.group(1)
-        nameserver = match.group(2)
-        ns_records.append({
-          "name": hostname,
-          "nameserver": nameserver
-        })
-
+  for rr in _iter_rrs(zone_file):
+    if rr["type"] == "NS":
+      ns_records.append({"name": rr["name"],
+                         "nameserver": rr["value"].split()[0] if rr["value"] else ""})
   return ns_records
 
 
@@ -812,7 +904,8 @@ def main():
 
   elif command == "add-record" and len(sys.argv) >= 3:
     data = json.loads(sys.argv[2])
-    result = add_record(data['zone'], data['name'], data['type'], data['value'])
+    result = add_record(data['zone'], data['name'], data['type'], data['value'],
+                        data.get('createReverse', False))
     print(json.dumps(result))
 
   elif command == "update-record" and len(sys.argv) >= 3:
