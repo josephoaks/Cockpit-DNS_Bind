@@ -22,7 +22,7 @@ import {
   TextInput,
 } from '@patternfly/react-core';
 import { PlusIcon } from '@patternfly/react-icons';
-import { spawnBackend, spawnTsigBackend } from '../utils/backend';
+import { spawnBackend, reloadNotice, spawnTsigBackend } from '../utils/backend';
 import { TimeInput } from './TimeInput';
 
 export const ZoneEditorPage = ({ zone, onBack }) => {
@@ -178,11 +178,103 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
     setIsRecordModalOpen(true);
   };
 
+  // Any write returns a `reload` block; surface it when it did not apply
+  // cleanly, plus any validation warning the backend attached.
+  const noteWriteResult = (result) => {
+    const notice = reloadNotice(result);
+    if (result && result.warning) {
+      setError(result.warning);
+    } else if (notice) {
+      setError(notice.text);
+    } else {
+      setError(null);
+    }
+  };
+
+  // A PTR was skipped only because its reverse zone does not exist yet. We know
+  // the address and the name, so the zone name is derivable -- offer to create
+  // it rather than sending the user off to build it by hand.
+  const offerReverseZone = async (ptr, recName, recValue) => {
+    if (!ptr || ptr.status !== 'skipped' || !ptr.needed) return false;
+    if (!confirm(`${ptr.message}\n\nCreate ${ptr.needed} now and add the PTR?\n\n`
+      + `It will be created as a primary zone using the same name server and `
+      + `contact as ${zone.name}.`)) return false;
+
+    const out = await spawnBackend(['add-ptr', JSON.stringify({
+      zone: zone.name, name: recName, value: recValue, createReverseZone: true
+    })]);
+    const res = JSON.parse(out);
+    if (res.error) {
+      setError('Failed to create reverse zone: ' + res.error);
+      return false;
+    }
+    if (res.ptr && res.ptr.status !== 'created') {
+      setError(res.ptr.message);
+      return false;
+    }
+    return true;
+  };
+
+  const handleCreatePtr = async (record) => {
+    try {
+      const output = await spawnBackend(['add-ptr', JSON.stringify({
+        zone: zone.name, name: record.name, value: record.value
+      })]);
+      const result = JSON.parse(output);
+
+      if (result.error) {
+        setError('Failed to create PTR: ' + result.error);
+        return;
+      }
+
+      const ptr = result.ptr || {};
+      // A second PTR on one address is a deliberate choice, not a default.
+      if (ptr.status === 'conflict') {
+        if (!confirm(ptr.message + '\n\nAdd the second PTR anyway?')) return;
+        const forced = await spawnBackend(['add-ptr', JSON.stringify({
+          zone: zone.name, name: record.name, value: record.value, force: true
+        })]);
+        const forcedResult = JSON.parse(forced);
+        if (forcedResult.error) {
+          setError('Failed to create PTR: ' + forcedResult.error);
+          return;
+        }
+      } else if (ptr.status === 'skipped' && ptr.needed) {
+        if (!await offerReverseZone(ptr, record.name, record.value)) return;
+      } else if (ptr.status !== 'created') {
+        alert(ptr.message);
+        return;
+      }
+
+      noteWriteResult(result);
+      await loadZoneDetails();
+    } catch (err) {
+      console.error('Failed to create PTR:', err);
+      setError('Failed to create PTR: ' + err.message);
+    }
+  };
+
   const handleDeleteRecord = async (record) => {
-    if (!confirm(`Delete record ${record.name}?`)) return;
+    if (!confirm(`Delete ${record.type} record ${record.name}?`)) return;
+
+    // Only address records have a reverse counterpart worth cleaning up.
+    let deleteReverse = false;
+    if (record.type === 'A' || record.type === 'AAAA') {
+      deleteReverse = confirm(
+        `Also remove the matching PTR record for ${record.value}?\n\n` +
+        `Only a PTR pointing back at ${record.name} is removed; other names ` +
+        `sharing this address keep theirs.`
+      );
+    }
 
     try {
-      const data = { zone: zone.name, name: record.name };
+      const data = {
+        zone: zone.name,
+        name: record.name,
+        type: record.type,
+        value: record.value,
+        deleteReverse
+      };
       const output = await spawnBackend(['delete-record', JSON.stringify(data)]);
       const result = JSON.parse(output);
 
@@ -191,6 +283,11 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
         return;
       }
 
+      if (result.ptr && result.ptr.status === 'skipped') {
+        alert(result.ptr.message);
+      }
+
+      noteWriteResult(result);
       await loadZoneDetails();
     } catch (err) {
       console.error('Failed to delete record:', err);
@@ -209,6 +306,7 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
         const data = {
           zone: zone.name,
           oldName: editingRecord.name,
+          oldValue: editingRecord.value,
           name: recordName,
           type: recordType,
           value: recordValue
@@ -235,10 +333,24 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
           setError('Failed to add record: ' + result.error);
           return;
         }
-        // Reverse (PTR) was requested but couldn't be created cleanly — let the user know.
-        if (result.ptr && result.ptr.status !== 'created') {
+        // Reverse (PTR) was requested but couldn't be created cleanly.
+        if (result.ptr && result.ptr.status === 'conflict') {
+          // One PTR per address is the recommended setup; make the user opt in.
+          if (confirm(result.ptr.message + '\n\nAdd the second PTR anyway?')) {
+            const forced = await spawnBackend(['add-ptr', JSON.stringify({
+              zone: zone.name, name: recordName, value: recordValue, force: true
+            })]);
+            const forcedResult = JSON.parse(forced);
+            if (forcedResult.error) {
+              setError('Failed to create PTR: ' + forcedResult.error);
+            }
+          }
+        } else if (result.ptr && result.ptr.status === 'skipped' && result.ptr.needed) {
+          await offerReverseZone(result.ptr, recordName, recordValue);
+        } else if (result.ptr && result.ptr.status !== 'created') {
           alert(result.ptr.message);
         }
+        noteWriteResult(result);
       }
 
       await loadZoneDetails();
@@ -896,6 +1008,11 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
                       <td role="cell">{record.type}</td>
                       <td role="cell">{record.value}</td>
                       <td role="cell" className="pf-v6-c-table__action">
+                        {(record.type === 'A' || record.type === 'AAAA') && (
+                          <Button variant="secondary" onClick={() => handleCreatePtr(record)} style={{ marginRight: '0.5rem' }}>
+                            Reverse
+                          </Button>
+                        )}
                         <Button variant="secondary" onClick={() => handleEditRecord(record)} style={{ marginRight: '0.5rem' }}>
                           Change
                         </Button>

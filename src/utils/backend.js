@@ -105,3 +105,39 @@ export function spawnForwardersBackend(args) {
     });
   });
 }
+
+const BINDCTL_BACKEND_PATH = "/usr/share/cockpit/dns-bind/backend/bindctl.py";
+
+export function spawnBindctl(args) {
+  return new Promise((resolve, reject) => {
+    const process = cockpit.spawn(['/usr/bin/python3', BINDCTL_BACKEND_PATH, ...args], {
+      superuser: "require",
+      err: "out"
+    });
+
+    let stdout = "";
+
+    process.stream((data) => {
+      stdout += data;
+    });
+
+    process.then(() => {
+      if (!stdout || stdout.trim() === "") {
+        reject(new Error("Backend returned empty output"));
+      } else {
+        resolve(stdout);
+      }
+    }).catch((err) => {
+      reject(new Error(err.message || "Backend failed"));
+    });
+  });
+}
+
+// Turn the `reload` block returned by a write into a message for the UI, or
+// null when everything applied cleanly and there is nothing to report.
+export function reloadNotice(result) {
+  const r = result && result.reload;
+  if (!r || r.status === 'reloaded') return null;
+  if (r.status === 'not-running') return { variant: 'warning', text: r.message };
+  return { variant: 'danger', text: r.message };
+}

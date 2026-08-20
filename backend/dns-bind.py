@@ -8,12 +8,54 @@ import json
 import sys
 import re
 import ipaddress
+
+import bindctl
 from pathlib import Path
 from datetime import datetime
 
 NAMED_CONF = "/etc/named.conf"
 NAMED_D_DIR = "/etc/named.d"
 ZONES_BASE = "/var/lib/named"
+
+
+def _validate_zone_name(zone_name):
+  """Reject anything that is not a plain domain name.
+
+  The zone name is used to build the zone file path, so a name containing a
+  path separator or .. would write outside the zone directory -- as root. It is
+  also the place a network in CIDR notation gets typed by mistake, so that case
+  gets a message pointing at the reverse zone helper rather than a stat error.
+  """
+  n = (zone_name or "").strip()
+  if not n:
+    return "Zone name is required"
+  if re.fullmatch(r'[0-9a-fA-F.:]+/\d{1,3}', n):
+    return (f"{n} looks like a network, not a zone name. Use the reverse zone "
+            f"helper in the Add Zone dialog to work out the in-addr.arpa or "
+            f"ip6.arpa name for it.")
+  if len(n) > 253:
+    return "Zone name is longer than 253 characters"
+  if n in ('.', '..') or n.startswith('.') or '..' in n:
+    return f"{n} is not a valid zone name"
+  if not re.fullmatch(r'[A-Za-z0-9_*\-.]+\.?', n):
+    return (f"{n} is not a valid zone name. Use letters, digits, hyphens and "
+            f"dots only.")
+  return None
+
+
+def _qualify(name):
+  """Add the trailing dot to a name that is clearly meant to be absolute.
+
+  A name written without a trailing dot is relative to the zone origin, so
+  "ns1.pirate.com" in the pirate.com zone becomes ns1.pirate.com.pirate.com --
+  which is almost never what someone typing a nameserver or mail host means. A
+  single label with no dots ("ns1") is left alone, since that genuinely is a
+  relative name.
+  """
+  n = (name or "").strip()
+  if not n or n.endswith('.') or '.' not in n:
+    return n
+  return n + '.'
 
 
 def read_zones():
@@ -32,12 +74,74 @@ def read_zones():
   return zones
 
 
-def create_zone(zone_name, zone_type, primary_ns, contact_email):
-  """Create a new DNS zone file with SOA record"""
+_ZONE_TYPES = {"primary": "master", "master": "master",
+               "secondary": "slave", "slave": "slave",
+               "forward": "forward"}
 
-  # Validate inputs
-  if not zone_name or not primary_ns or not contact_email:
+
+def _validate_addresses(addrs, label):
+  """Return (cleaned_list, error). Accepts IPv4/IPv6 literals."""
+  cleaned = []
+  for a in addrs or []:
+    a = a.strip()
+    if not a:
+      continue
+    try:
+      ipaddress.ip_address(a)
+    except ValueError:
+      return None, f"{a} is not a valid IP address for {label}"
+    cleaned.append(a)
+  if not cleaned:
+    return None, f"At least one {label} address is required"
+  return cleaned, None
+
+
+def create_zone(zone_name, zone_type, primary_ns, contact_email,
+                primaries=None, forwarders=None):
+  """Create a new DNS zone: primary (with zone file), secondary, or forward."""
+
+  if not zone_name:
+    return {"error": "Zone name is required"}
+
+  name_err = _validate_zone_name(zone_name)
+  if name_err:
+    return {"error": name_err}
+  zone_name = zone_name.strip()
+
+  btype = _ZONE_TYPES.get((zone_type or "").strip().lower())
+  if not btype:
+    return {"error": f"Unsupported zone type: {zone_type}"}
+
+  if any(z['name'] == zone_name for z in read_zones()):
+    return {"error": f"Zone {zone_name} already exists"}
+
+  # Secondary and forward zones hold no locally authored data: a secondary's
+  # contents arrive by transfer, and a forward zone has none at all.
+  if btype == "slave":
+    addrs, err = _validate_addresses(primaries, "primary server")
+    if err:
+      return {"error": err}
+    zone_body = ("\ttype slave;\n"
+                 f"\tfile \"slave/{zone_name}\";\n"
+                 "\tprimaries { " + " ".join(f"{a};" for a in addrs) + " };\n")
+    Path(f"{ZONES_BASE}/slave").mkdir(parents=True, exist_ok=True)
+    return _write_zone_definition(zone_name, zone_body, {"type": "Secondary"})
+
+  if btype == "forward":
+    addrs, err = _validate_addresses(forwarders, "forwarder")
+    if err:
+      return {"error": err}
+    zone_body = ("\ttype forward;\n"
+                 "\tforward only;\n"
+                 "\tforwarders { " + " ".join(f"{a};" for a in addrs) + " };\n")
+    return _write_zone_definition(zone_name, zone_body, {"type": "Forward"})
+
+  # Primary
+  if not primary_ns or not contact_email:
     return {"error": "Zone name, primary NS, and contact email are required"}
+
+  primary_ns = _qualify(primary_ns)
+  contact_email = _qualify(contact_email)
 
   # Determine zone file path
   zone_file = f"{ZONES_BASE}/master/{zone_name}"
@@ -77,27 +181,41 @@ def create_zone(zone_name, zone_type, primary_ns, contact_email):
   except Exception as e:
     return {"error": f"Failed to create zone file: {str(e)}"}
 
-  # Add zone to named.conf
-  try:
-    zone_definition = f"""
-zone "{zone_name}" in {{
-\ttype master;
-\tfile "master/{zone_name}";
-}};
-"""
-    with open(NAMED_CONF, 'a') as f:
-      f.write(zone_definition)
-  except Exception as e:
+  zone_body = ("\ttype master;\n"
+               f"\tfile \"master/{zone_name}\";\n")
+  result = _write_zone_definition(zone_name, zone_body,
+                                  {"type": "Primary", "file": zone_file, "serial": serial})
+  if "error" in result:
     # Clean up zone file if we can't update named.conf
     Path(zone_file).unlink(missing_ok=True)
+    return result
+
+  # A new zone whose apex NS has no address record will not load. Say so now
+  # rather than leaving it to be discovered the next time named restarts.
+  ok, msg = bindctl.check_zone(zone_name, zone_file)
+  if not ok:
+    result["warning"] = (f"The zone was created, but named will not load it yet: {msg}")
+  return result
+
+
+def _write_zone_definition(zone_name, zone_body, extra):
+  """Append a zone block to named.conf and return a result dict."""
+  backup = bindctl.snapshot(NAMED_CONF)
+  try:
+    with open(NAMED_CONF, 'a') as f:
+      f.write(f"\nzone \"{zone_name}\" in {{\n{zone_body}}};\n")
+  except Exception as e:
     return {"error": f"Failed to update named.conf: {str(e)}"}
 
-  return {
-    "success": True,
-    "zone": zone_name,
-    "file": zone_file,
-    "serial": serial
-  }
+  err = bindctl.verify_conf_or_restore(backup, NAMED_CONF)
+  if err:
+    return {"error": err}
+
+  result = {"success": True, "zone": zone_name}
+  result.update(extra)
+  # A new zone is not picked up by a reload; named.conf has to be reread.
+  result["reload"] = bindctl.reconfig()
+  return result
 
 
 def delete_zone(zone_name):
@@ -118,13 +236,22 @@ def delete_zone(zone_name):
       return {"error": f"Failed to delete zone file: {str(e)}"}
 
   # Remove zone from named.conf
+  conf_backup = bindctl.snapshot(NAMED_CONF)
   try:
     with open(NAMED_CONF, 'r') as f:
       content = f.read()
 
-    # Remove the zone definition
-    zone_pattern = rf'zone\s+"{re.escape(zone_name)}"\s+(?:in\s+)?\{{[^}}]+\}};?\s*'
-    content = re.sub(zone_pattern, '', content, flags=re.IGNORECASE | re.DOTALL)
+    # Brace-aware removal: a secondary or forward zone contains nested blocks
+    # (primaries { ... };), which a non-greedy [^}]+ match would truncate.
+    header = re.compile(rf'\n?zone\s+"{re.escape(zone_name)}"\s+(?:in\s+)?\{{',
+                        re.IGNORECASE)
+    m = header.search(content)
+    if m:
+      brace_idx = content.index('{', m.start())
+      _, end_idx = _extract_block(content, brace_idx)
+      tail = content[end_idx:]
+      trailing = len(tail) - len(tail.lstrip(';\n'))
+      content = content[:m.start()] + tail[trailing:]
 
     with open(NAMED_CONF, 'w') as f:
       f.write(content)
@@ -132,7 +259,11 @@ def delete_zone(zone_name):
   except Exception as e:
     return {"error": f"Failed to update named.conf: {str(e)}"}
 
-  return {"success": True, "zone": zone_name}
+  err = bindctl.verify_conf_or_restore(conf_backup, NAMED_CONF)
+  if err:
+    return {"error": err}
+
+  return {"success": True, "zone": zone_name, "reload": bindctl.reconfig()}
 
 
 def _extract_block(content, start_brace):
@@ -252,18 +383,23 @@ def _looks_like_ttl(tok):
 
 
 def _logical_records(zone_file):
-  """Yield (had_leading_ws, text) per logical RR, joining ()-continuations."""
+  """Yield (had_leading_ws, text, start, end) per logical RR.
+
+  start/end are 0-based inclusive source line indices, so mutators can splice
+  the exact lines a record occupies instead of re-matching raw text.
+  """
   with open(zone_file, 'r') as f:
     raw = f.read().splitlines()
 
-  buf, had_ws, depth = "", False, 0
-  for line in raw:
+  buf, had_ws, depth, start = "", False, 0, 0
+  for lineno, line in enumerate(raw):
     text = _strip_comment(line)
     if depth == 0:
       if text.strip() == "":
         continue
       had_ws = text[:1].isspace()
       buf = text
+      start = lineno
     else:
       buf += " " + text.strip()
     depth += text.count("(") - text.count(")")
@@ -271,7 +407,7 @@ def _logical_records(zone_file):
       depth = 0
       merged = buf.replace("(", " ").replace(")", " ").strip()
       if merged:
-        yield had_ws, merged
+        yield had_ws, merged, start, lineno
       buf = ""
 
 
@@ -281,7 +417,7 @@ def _iter_rrs(zone_file):
     return
   last_owner = "@"
   origin = None
-  for had_ws, text in _logical_records(zone_file):
+  for had_ws, text, start, end in _logical_records(zone_file):
     if text.startswith('$'):
       parts = text.split()
       if len(parts) >= 2 and parts[0].upper() == "$ORIGIN":
@@ -311,7 +447,8 @@ def _iter_rrs(zone_file):
     idx += 1
     value = " ".join(toks[idx:]).strip()
     disp = origin if (owner == "@" and origin) else owner
-    yield {"name": disp, "ttl": ttl, "rrclass": rrclass, "type": rtype, "value": value}
+    yield {"name": disp, "ttl": ttl, "rrclass": rrclass, "type": rtype, "value": value,
+           "start": start, "end": end}
 
 
 def read_zone_records(zone_file):
@@ -374,6 +511,9 @@ def increment_serial(zone_file):
 
 def update_soa(zone_name, soa_data):
   """Update SOA record in a zone file"""
+  soa_data = dict(soa_data)
+  soa_data['primary'] = _qualify(soa_data.get('primary', ''))
+  soa_data['contact'] = _qualify(soa_data.get('contact', ''))
   zones = read_zones()
   zone = next((z for z in zones if z['name'] == zone_name), None)
 
@@ -381,6 +521,7 @@ def update_soa(zone_name, soa_data):
     return {"error": f"Zone {zone_name} not found"}
 
   zone_file = zone['file']
+  guard = bindctl.guard(zone_name, zone_file)
 
   # Read the file
   with open(zone_file, 'r') as f:
@@ -407,7 +548,21 @@ def update_soa(zone_name, soa_data):
   with open(zone_file, 'w') as f:
     f.write(content)
 
-  return {"success": True}
+  return _commit_zone(guard, {"success": True})
+
+
+def _commit_zone(guard, result):
+  """Validate a modified zone file, roll back if this change broke it, reload.
+
+  Returns either an error dict or the result dict with reload status attached.
+  """
+  err, warning = bindctl.verify_or_restore(guard)
+  if err:
+    return {"error": err}
+  if warning:
+    result["warning"] = warning
+  result["reload"] = bindctl.reload_zone(guard["zone"])
+  return result
 
 
 def _reverse_fqdn(ip_value):
@@ -433,12 +588,34 @@ def _find_reverse_zone(reverse_fqdn, zones):
   return best
 
 
-def _ptr_owner(reverse_fqdn, zone_name):
-  """Label(s) of reverse_fqdn relative to the reverse zone origin (or '@')."""
-  rlabels = reverse_fqdn.split('.')
-  zlabels = zone_name.rstrip('.').split('.')
-  owner = rlabels[:len(rlabels) - len(zlabels)]
-  return '.'.join(owner) if owner else '@'
+def _validate_rdata(record_type, value):
+  """Reject rdata that would stop the zone loading. Returns an error or None.
+
+  Only types with an unambiguous shape are checked; anything else is passed
+  through so the plugin does not block record types it does not model.
+  """
+  v = (value or "").strip()
+  if not v:
+    return "Record value is required"
+
+  if record_type == "A":
+    try:
+      if not isinstance(ipaddress.ip_address(v), ipaddress.IPv4Address):
+        return f"{v} is an IPv6 address; use an AAAA record"
+    except ValueError:
+      return f"{v} is not a valid IPv4 address"
+  elif record_type == "AAAA":
+    try:
+      if not isinstance(ipaddress.ip_address(v), ipaddress.IPv6Address):
+        return f"{v} is an IPv4 address; use an A record"
+    except ValueError:
+      return f"{v} is not a valid IPv6 address"
+  elif record_type in ("CNAME", "PTR", "DNAME"):
+    if any(c.isspace() for c in v):
+      return f"A {record_type} value must be a single domain name"
+    if not re.fullmatch(r'[A-Za-z0-9_*\-./]+', v):
+      return f"{v} is not a valid domain name"
+  return None
 
 
 def _fqdn_for(name, zone_name):
@@ -450,27 +627,200 @@ def _fqdn_for(name, zone_name):
   return f"{name}.{base}."
 
 
-def _create_ptr_record(record_name, ip_value, forward_zone_name, zones):
-  """Best-effort PTR creation for an A/AAAA. Never raises; returns a status dict."""
+def _norm_name(name, zone_name):
+  """Canonical comparison key for an owner name, form-agnostic."""
+  return _fqdn_for(name, zone_name).lower()
+
+
+def _norm_value(value):
+  """Canonical comparison key for rdata: collapse whitespace, fold case."""
+  return " ".join(value.split()).lower()
+
+
+def _find_rrs(zone_file, zone_name, name=None, rtype=None, value=None):
+  """Parsed RRs matching the given criteria, compared canonically."""
+  want_name = _norm_name(name, zone_name) if name is not None else None
+  want_type = rtype.upper() if rtype else None
+  want_value = _norm_value(value) if value is not None else None
+
+  hits = []
+  for rr in _iter_rrs(zone_file):
+    if want_name is not None and _norm_name(rr["name"], zone_name) != want_name:
+      continue
+    if want_type is not None and rr["type"] != want_type:
+      continue
+    if want_value is not None and _norm_value(rr["value"]) != want_value:
+      continue
+    hits.append(rr)
+  return hits
+
+
+def _splice_lines(zone_file, spans, replacement=None):
+  """Remove the given (start, end) line spans, optionally inserting a
+  replacement line at the position of the first span."""
+  with open(zone_file, 'r') as f:
+    lines = f.readlines()
+
+  drop = set()
+  for start, end in spans:
+    drop.update(range(start, end + 1))
+
+  first = min(drop)
+  out = []
+  for i, line in enumerate(lines):
+    if i in drop:
+      if i == first and replacement is not None:
+        out.append(replacement)
+      continue
+    out.append(line)
+
+  with open(zone_file, 'w') as f:
+    f.writelines(out)
+
+
+def _suggest_reverse_zone(rev):
+  """Reverse zone name that would normally hold a PTR for this address.
+
+  Assumes the usual delegation boundary: /24 for IPv4, /64 for IPv6. Anything
+  classless (RFC 2317) or otherwise unusual is the admin's call, so this is a
+  hint in an error message rather than something acted on automatically.
+  """
+  labels = rev.split('.')
+  if rev.endswith('ip6.arpa'):
+    return '.'.join(labels[-(2 + 16):]) if len(labels) > 18 else rev
+  return '.'.join(labels[-(2 + 3):]) if len(labels) > 5 else rev
+
+
+def _create_reverse_zone_for(rev, forward_zone):
+  """Create the reverse zone that would hold a PTR for this address.
+
+  The SOA is inherited from the forward zone, so the caller does not have to
+  ask for a primary name server and contact that the admin has already given
+  once. The boundary is the conventional /24 or /64 -- anything classless is
+  the admin's call and is not created automatically.
+  """
+  needed = _suggest_reverse_zone(rev)
+  soa = parse_soa_record(forward_zone.get('file')) if forward_zone else None
+  primary = (soa or {}).get('primary')
+  contact = (soa or {}).get('contact')
+  if not primary or not contact:
+    return None, (f"Could not read the SOA of {forward_zone.get('name')} to build "
+                  f"{needed}; create the zone manually from the DNS Zones page.")
+
+  result = create_zone(needed, 'Primary', primary, contact)
+  if 'error' in result:
+    return None, f"Could not create {needed}: {result['error']}"
+  return needed, None
+
+
+def _create_ptr_record(record_name, ip_value, forward_zone_name, zones, force=False,
+                       create_zone_if_missing=False):
+  """Best-effort PTR creation for an A/AAAA. Never raises; returns a status dict.
+
+  One PTR per address is the recommended practice: a reverse lookup that returns
+  several names resolves them in no defined order, which breaks forward-confirmed
+  reverse DNS. When the address already has a PTR to a different name we stop and
+  report a conflict; the caller decides whether to force a second record.
+  """
   rev = _reverse_fqdn(ip_value)
   if not rev:
     return {"status": "skipped", "message": f"{ip_value} is not a valid IP address; no PTR created"}
   rzone = _find_reverse_zone(rev, zones)
+
   if not rzone or not rzone.get('file') or not Path(rzone['file']).exists():
-    return {"status": "skipped", "message": f"No hosted reverse zone for {ip_value}; PTR not created"}
-  owner = _ptr_owner(rev, rzone['name'])
+    needed = _suggest_reverse_zone(rev)
+    if not create_zone_if_missing:
+      return {"status": "skipped",
+              "needed": needed,
+              "forward": forward_zone_name,
+              "message": (f"No reverse zone hosts {ip_value}, so no PTR was created. "
+                          f"The zone that would hold it is {needed}.")}
+
+    forward = next((z for z in zones if z['name'] == forward_zone_name), None)
+    created, err = _create_reverse_zone_for(rev, forward)
+    if err:
+      return {"status": "skipped", "needed": needed, "message": err}
+    zones = read_zones()
+    rzone = _find_reverse_zone(rev, zones)
+    if not rzone or not rzone.get('file'):
+      return {"status": "skipped", "needed": needed,
+              "message": f"Created {created} but could not find it afterwards"}
+    zone_created = created
+  else:
+    zone_created = None
+
+  owner = rev + '.'
   target = _fqdn_for(record_name, forward_zone_name)
-  for rr in _iter_rrs(rzone['file']):
-    if rr['type'] == 'PTR' and rr['name'].rstrip('.').lower() in (owner.lower(), rev.lower()):
-      return {"status": "exists",
-              "message": f"PTR for {ip_value} already exists ({rr['value']}); left unchanged"}
+  existing = _find_rrs(rzone['file'], rzone['name'], name=owner, rtype='PTR')
+
+  if existing and not force:
+    current = existing[0]['value']
+    if _norm_value(current) == _norm_value(target):
+      return {"status": "unchanged",
+              "message": f"PTR for {ip_value} already points to {target}"}
+    return {"status": "conflict",
+            "zone": rzone['name'],
+            "ip": ip_value,
+            "existing": current,
+            "target": target,
+            "message": (f"{ip_value} already has a PTR record pointing to "
+                        f"{current.rstrip('.')}. "
+                        f"Adding a second PTR to {target} means reverse lookups for this "
+                        f"address return both names in no defined order, which can break "
+                        f"mail delivery and other forward-confirmed reverse DNS checks. "
+                        f"The usual fix is a CNAME in {forward_zone_name} instead.")}
+
+  guard = bindctl.guard(rzone['name'], rzone['file'])
   with open(rzone['file'], 'a') as f:
     f.write(f"{owner}\tIN PTR\t{target}\n")
   increment_serial(rzone['file'])
-  return {"status": "created", "message": f"PTR {owner} -> {target} added to {rzone['name']}"}
+  err, warning = bindctl.verify_or_restore(guard)
+  if err:
+    return {"status": "failed", "message": err}
+  msg = f"PTR {owner} -> {target} added to {rzone['name']}"
+  if zone_created:
+    msg = f"Created reverse zone {zone_created} and added PTR {owner} -> {target}"
+  return {"status": "created",
+          "message": msg,
+          "zoneCreated": zone_created,
+          "warning": warning,
+          "reload": bindctl.reload_zone(rzone['name'])}
 
 
-def add_record(zone_name, record_name, record_type, record_value, create_ptr=False):
+def _delete_ptr_record(record_name, ip_value, forward_zone_name, zones):
+  """Remove the PTR for an A/AAAA being deleted, matched on its target name.
+
+  Matching on the target (not just the address) means round-robin and alias A
+  records sharing an address only ever drop their own PTR.
+  """
+  rev = _reverse_fqdn(ip_value)
+  if not rev:
+    return {"status": "skipped", "message": f"{ip_value} is not a valid IP address"}
+  rzone = _find_reverse_zone(rev, zones)
+  if not rzone or not rzone.get('file') or not Path(rzone['file']).exists():
+    return {"status": "skipped",
+            "message": f"No hosted reverse zone for {ip_value} ({_suggest_reverse_zone(rev)}); "
+                       f"nothing to remove"}
+
+  target = _fqdn_for(record_name, forward_zone_name)
+  hits = _find_rrs(rzone['file'], rzone['name'], name=rev + '.', rtype='PTR', value=target)
+  if not hits:
+    return {"status": "skipped", "message": f"No PTR for {ip_value} pointing to {target}"}
+
+  guard = bindctl.guard(rzone['name'], rzone['file'])
+  _splice_lines(rzone['file'], [(rr['start'], rr['end']) for rr in hits])
+  increment_serial(rzone['file'])
+  err, warning = bindctl.verify_or_restore(guard)
+  if err:
+    return {"status": "failed", "message": err}
+  return {"status": "deleted",
+          "message": f"PTR {rev}. -> {target} removed from {rzone['name']}",
+          "warning": warning,
+          "reload": bindctl.reload_zone(rzone['name'])}
+
+
+def add_record(zone_name, record_name, record_type, record_value, create_ptr=False,
+               force_ptr=False, create_reverse_zone=False):
   """Add a DNS record to a zone file"""
   zones = read_zones()
   zone = next((z for z in zones if z['name'] == zone_name), None)
@@ -479,11 +829,23 @@ def add_record(zone_name, record_name, record_type, record_value, create_ptr=Fal
     return {"error": f"Zone {zone_name} not found"}
 
   zone_file = zone['file']
+  guard = bindctl.guard(zone_name, zone_file)
 
-  # Check if record already exists
-  existing_records = read_zone_records(zone_file)
-  if any(r['name'] == record_name for r in existing_records):
-    return {"error": f"Record {record_name} already exists"}
+  err = _validate_rdata(record_type, record_value)
+  if err:
+    return {"error": err}
+
+  # An exact duplicate is an error; the same name may legitimately carry several
+  # records (round-robin A, an A alongside a TXT, and so on).
+  if _find_rrs(zone_file, zone_name, name=record_name, rtype=record_type, value=record_value):
+    return {"error": f"Record {record_name} {record_type} {record_value} already exists"}
+
+  # A name holding a CNAME cannot hold any other data (RFC 1034 3.6.2).
+  siblings = _find_rrs(zone_file, zone_name, name=record_name)
+  if record_type == 'CNAME' and siblings:
+    return {"error": f"{record_name} already has records; a CNAME cannot coexist with other data"}
+  if any(rr['type'] == 'CNAME' for rr in siblings):
+    return {"error": f"{record_name} is a CNAME; it cannot also hold a {record_type} record"}
 
   # Add the record
   with open(zone_file, 'a') as f:
@@ -492,13 +854,32 @@ def add_record(zone_name, record_name, record_type, record_value, create_ptr=Fal
   # Increment serial
   new_serial = increment_serial(zone_file)
 
-  result = {"success": True, "serial": new_serial}
+  result = _commit_zone(guard, {"success": True, "serial": new_serial})
+  if "error" in result:
+    return result
   if create_ptr and record_type in ("A", "AAAA"):
-    result["ptr"] = _create_ptr_record(record_name, record_value, zone_name, zones)
+    result["ptr"] = _create_ptr_record(record_name, record_value, zone_name, zones,
+                                       force=force_ptr,
+                                       create_zone_if_missing=create_reverse_zone)
   return result
 
 
-def update_record(zone_name, old_record_name, new_record_name, record_type, record_value):
+def add_ptr_for(zone_name, record_name, record_value, force=False, create_reverse_zone=False):
+  """Create the PTR for an existing A/AAAA.
+
+  Used both to confirm a forced second PTR and to backfill a record whose
+  reverse zone did not exist when it was added.
+  """
+  zones = read_zones()
+  if not any(z['name'] == zone_name for z in zones):
+    return {"error": f"Zone {zone_name} not found"}
+  return {"success": True,
+          "ptr": _create_ptr_record(record_name, record_value, zone_name, zones, force=force,
+                                    create_zone_if_missing=create_reverse_zone)}
+
+
+def update_record(zone_name, old_record_name, new_record_name, record_type, record_value,
+                  old_record_value=None):
   """Update a DNS record in a zone file"""
   zones = read_zones()
   zone = next((z for z in zones if z['name'] == zone_name), None)
@@ -507,38 +888,31 @@ def update_record(zone_name, old_record_name, new_record_name, record_type, reco
     return {"error": f"Zone {zone_name} not found"}
 
   zone_file = zone['file']
+  guard = bindctl.guard(zone_name, zone_file)
 
-  # Read the file
-  with open(zone_file, 'r') as f:
-    lines = f.readlines()
+  err = _validate_rdata(record_type, record_value)
+  if err:
+    return {"error": err}
 
-  # Find and update the record
-  updated = False
-  new_lines = []
+  hits = _find_rrs(zone_file, zone_name, name=old_record_name, rtype=record_type,
+                   value=old_record_value)
+  if not hits:
+    return {"error": f"Record {old_record_name} ({record_type}) not found"}
+  if len(hits) > 1:
+    return {"error": f"{old_record_name} has {len(hits)} {record_type} records; "
+                     f"cannot tell which to update"}
 
-  for line in lines:
-    # Check if this line contains the old record
-    if re.match(rf'^{re.escape(old_record_name)}\s+IN\s+A\s+', line):
-      # Replace with new record
-      new_lines.append(f"{new_record_name}\t\tIN {record_type}\t{record_value}\n")
-      updated = True
-    else:
-      new_lines.append(line)
-
-  if not updated:
-    return {"error": f"Record {old_record_name} not found"}
-
-  # Write back
-  with open(zone_file, 'w') as f:
-    f.writelines(new_lines)
+  _splice_lines(zone_file, [(hits[0]['start'], hits[0]['end'])],
+                replacement=f"{new_record_name}\t\tIN {record_type}\t{record_value}\n")
 
   # Increment serial
   new_serial = increment_serial(zone_file)
 
-  return {"success": True, "serial": new_serial}
+  return _commit_zone(guard, {"success": True, "serial": new_serial})
 
 
-def delete_record(zone_name, record_name):
+def delete_record(zone_name, record_name, record_type=None, record_value=None,
+                  delete_ptr=False):
   """Delete a DNS record from a zone file"""
   zones = read_zones()
   zone = next((z for z in zones if z['name'] == zone_name), None)
@@ -547,37 +921,33 @@ def delete_record(zone_name, record_name):
     return {"error": f"Zone {zone_name} not found"}
 
   zone_file = zone['file']
+  guard = bindctl.guard(zone_name, zone_file)
 
-  # Read the file
-  with open(zone_file, 'r') as f:
-    lines = f.readlines()
+  hits = _find_rrs(zone_file, zone_name, name=record_name, rtype=record_type,
+                   value=record_value)
+  if not hits:
+    label = f"{record_name} ({record_type})" if record_type else record_name
+    return {"error": f"Record {label} not found"}
+  if len(hits) > 1 and record_value is None:
+    return {"error": f"{record_name} matches {len(hits)} records; "
+                     f"specify the type and value to delete"}
 
-  # Filter out the record
-  new_lines = []
-  deleted = False
-
-  for line in lines:
-    # Check if this line contains the record to delete
-    if re.match(rf'^{re.escape(record_name)}\s+IN\s+A\s+', line):
-      deleted = True
-      continue  # Skip this line
-    new_lines.append(line)
-
-  if not deleted:
-    return {"error": f"Record {record_name} not found"}
-
-  # Write back
-  with open(zone_file, 'w') as f:
-    f.writelines(new_lines)
+  _splice_lines(zone_file, [(rr['start'], rr['end']) for rr in hits])
 
   # Increment serial
   new_serial = increment_serial(zone_file)
 
-  return {"success": True, "serial": new_serial}
+  result = _commit_zone(guard, {"success": True, "serial": new_serial})
+  if "error" in result:
+    return result
+  if delete_ptr and record_type in ("A", "AAAA") and record_value:
+    result["ptr"] = _delete_ptr_record(record_name, record_value, zone_name, zones)
+  return result
 
 
 def add_mx_record(zone_name, record_name, priority, mailserver):
   """Add an MX record to a zone file"""
+  mailserver = _qualify(mailserver)
   zones = read_zones()
   zone = next((z for z in zones if z['name'] == zone_name), None)
 
@@ -585,6 +955,7 @@ def add_mx_record(zone_name, record_name, priority, mailserver):
     return {"error": f"Zone {zone_name} not found"}
 
   zone_file = zone['file']
+  guard = bindctl.guard(zone_name, zone_file)
 
   try:
     priority = int(priority)
@@ -602,11 +973,12 @@ def add_mx_record(zone_name, record_name, priority, mailserver):
 
   new_serial = increment_serial(zone_file)
 
-  return {"success": True, "serial": new_serial}
+  return _commit_zone(guard, {"success": True, "serial": new_serial})
 
 
 def update_mx_record(zone_name, old_name, old_mailserver, new_name, priority, mailserver):
   """Update an MX record in a zone file"""
+  mailserver = _qualify(mailserver)
   zones = read_zones()
   zone = next((z for z in zones if z['name'] == zone_name), None)
 
@@ -614,6 +986,7 @@ def update_mx_record(zone_name, old_name, old_mailserver, new_name, priority, ma
     return {"error": f"Zone {zone_name} not found"}
 
   zone_file = zone['file']
+  guard = bindctl.guard(zone_name, zone_file)
 
   try:
     priority = int(priority)
@@ -644,11 +1017,12 @@ def update_mx_record(zone_name, old_name, old_mailserver, new_name, priority, ma
 
   new_serial = increment_serial(zone_file)
 
-  return {"success": True, "serial": new_serial}
+  return _commit_zone(guard, {"success": True, "serial": new_serial})
 
 
 def delete_mx_record(zone_name, record_name, mailserver):
   """Delete an MX record from a zone file"""
+  mailserver = _qualify(mailserver)
   zones = read_zones()
   zone = next((z for z in zones if z['name'] == zone_name), None)
 
@@ -656,6 +1030,7 @@ def delete_mx_record(zone_name, record_name, mailserver):
     return {"error": f"Zone {zone_name} not found"}
 
   zone_file = zone['file']
+  guard = bindctl.guard(zone_name, zone_file)
 
   with open(zone_file, 'r') as f:
     lines = f.readlines()
@@ -678,7 +1053,7 @@ def delete_mx_record(zone_name, record_name, mailserver):
 
   new_serial = increment_serial(zone_file)
 
-  return {"success": True, "serial": new_serial}
+  return _commit_zone(guard, {"success": True, "serial": new_serial})
 
 
 def list_zones():
@@ -761,54 +1136,71 @@ def read_zone_options(zone_name):
 
 
 def update_zone_options(zone_name, options):
-  """Update zone options in named.conf"""
+  """Update zone options in named.conf.
+
+  Rewrites the zone block using brace-aware extraction. The previous regex
+  captured up to the first closing brace, so once the block contained a nested
+  statement such as allow-transfer { any; }, the next edit truncated the block
+  and stranded its tail in the file -- which is how named.conf gets corrupted
+  on the second options change rather than the first.
+  """
   if not Path(NAMED_CONF).exists():
     return {"error": "named.conf not found"}
-  
+
   with open(NAMED_CONF, 'r') as f:
     content = f.read()
-  
-  # Find and replace zone block
-  zone_pattern = rf'zone\s+"{re.escape(zone_name)}"\s+(?:in\s+)?\{{([^}}]+)\}}'
-  match = re.search(zone_pattern, content, re.IGNORECASE | re.DOTALL)
-  
-  if not match:
+
+  header = re.compile(rf'zone\s+"{re.escape(zone_name)}"\s+(?:in\s+)?\{{',
+                      re.IGNORECASE)
+  m = header.search(content)
+  if not m:
     return {"error": f"Zone {zone_name} not found in named.conf"}
-  
-  old_block = match.group(0)
-  zone_content = match.group(1)
-  
-  # Remove old allow-update and allow-transfer statements
-  zone_content = re.sub(r'\s*allow-update\s*\{[^}]+\};?\s*', '\n', zone_content)
-  zone_content = re.sub(r'\s*allow-transfer\s*\{[^}]+\};?\s*', '\n', zone_content)
-  
-  # Add new options
+
+  brace_idx = content.index('{', m.start())
+  zone_content, end_idx = _extract_block(content, brace_idx)
+
+  # Drop the statements we are about to rewrite, nested braces and all.
+  kept = []
+  i = 0
+  managed = re.compile(r'(allow-update|allow-transfer)\s*\{', re.IGNORECASE)
+  while i < len(zone_content):
+    hit = managed.search(zone_content, i)
+    if not hit:
+      kept.append(zone_content[i:])
+      break
+    kept.append(zone_content[i:hit.start()])
+    _, after = _extract_block(zone_content, zone_content.index('{', hit.start()))
+    while after < len(zone_content) and zone_content[after] in ';':
+      after += 1
+    i = after
+  zone_content = "".join(kept)
+
   new_options = []
-  
   if options.get('allowDynamicUpdates') and options.get('tsigKey'):
     new_options.append(f'\tallow-update {{ key "{options["tsigKey"]}"; }};')
-  
   if options.get('enableZoneTransport'):
     acls = options.get('acls', [])
     if acls:
       acl_list = '; '.join([acl for acl in acls]) + ';'
       new_options.append(f'\tallow-transfer {{ {acl_list} }};')
-  
-  # Build new zone block
-  new_zone_content = zone_content.strip()
+
+  body = "\n".join(line for line in zone_content.splitlines() if line.strip())
   if new_options:
-    new_zone_content += '\n' + '\n'.join(new_options) + '\n'
-  
-  new_block = f'zone "{zone_name}" in {{\n{new_zone_content}\n}}'
-  
-  # Replace in content
-  content = content.replace(old_block, new_block)
-  
-  # Write back
+    body += "\n" + "\n".join(new_options)
+
+  new_block = f'zone "{zone_name}" in {{\n{body}\n}}'
+  backup = bindctl.snapshot(NAMED_CONF)
+  updated = content[:m.start()] + new_block + content[end_idx:]
+
   with open(NAMED_CONF, 'w') as f:
-    f.write(content)
-  
-  return {"success": True}
+    f.write(updated)
+
+  err = bindctl.verify_conf_or_restore(backup, NAMED_CONF)
+  if err:
+    return {"error": err}
+
+  return {"success": True, "reload": bindctl.reconfig()}
+
 
 def read_ns_records(zone_file):
   """Read NS records from a zone file (owner-inheritance safe)."""
@@ -822,6 +1214,7 @@ def read_ns_records(zone_file):
 
 def add_ns_record(zone_name, record_name, nameserver):
   """Add an NS record to a zone file"""
+  nameserver = _qualify(nameserver)
   zones = read_zones()
   zone = next((z for z in zones if z['name'] == zone_name), None)
 
@@ -829,6 +1222,7 @@ def add_ns_record(zone_name, record_name, nameserver):
     return {"error": f"Zone {zone_name} not found"}
 
   zone_file = zone['file']
+  guard = bindctl.guard(zone_name, zone_file)
 
   existing_records = read_ns_records(zone_file)
 
@@ -841,11 +1235,12 @@ def add_ns_record(zone_name, record_name, nameserver):
 
   new_serial = increment_serial(zone_file)
 
-  return {"success": True, "serial": new_serial}
+  return _commit_zone(guard, {"success": True, "serial": new_serial})
 
 
 def delete_ns_record(zone_name, record_name, nameserver):
   """Delete an NS record from a zone file"""
+  nameserver = _qualify(nameserver)
   zones = read_zones()
   zone = next((z for z in zones if z['name'] == zone_name), None)
 
@@ -853,6 +1248,7 @@ def delete_ns_record(zone_name, record_name, nameserver):
     return {"error": f"Zone {zone_name} not found"}
 
   zone_file = zone['file']
+  guard = bindctl.guard(zone_name, zone_file)
 
   with open(zone_file, 'r') as f:
     lines = f.readlines()
@@ -875,7 +1271,7 @@ def delete_ns_record(zone_name, record_name, nameserver):
 
   new_serial = increment_serial(zone_file)
 
-  return {"success": True, "serial": new_serial}
+  return _commit_zone(guard, {"success": True, "serial": new_serial})
 
 
 def main():
@@ -894,7 +1290,9 @@ def main():
 
   elif command == "create-zone" and len(sys.argv) >= 3:
     data = json.loads(sys.argv[2])
-    result = create_zone(data['name'], data['type'], data['primary'], data['contact'])
+    result = create_zone(data['name'], data['type'], data.get('primary'),
+                         data.get('contact'), data.get('primaries'),
+                         data.get('forwarders'))
     print(json.dumps(result))
 
   elif command == "delete-zone" and len(sys.argv) >= 3:
@@ -905,17 +1303,28 @@ def main():
   elif command == "add-record" and len(sys.argv) >= 3:
     data = json.loads(sys.argv[2])
     result = add_record(data['zone'], data['name'], data['type'], data['value'],
-                        data.get('createReverse', False))
+                        data.get('createReverse', False),
+                        data.get('forceReverse', False),
+                        data.get('createReverseZone', False))
+    print(json.dumps(result))
+
+  elif command == "add-ptr" and len(sys.argv) >= 3:
+    data = json.loads(sys.argv[2])
+    result = add_ptr_for(data['zone'], data['name'], data['value'],
+                         data.get('force', False),
+                         data.get('createReverseZone', False))
     print(json.dumps(result))
 
   elif command == "update-record" and len(sys.argv) >= 3:
     data = json.loads(sys.argv[2])
-    result = update_record(data['zone'], data['oldName'], data['name'], data['type'], data['value'])
+    result = update_record(data['zone'], data['oldName'], data['name'], data['type'],
+                           data['value'], data.get('oldValue'))
     print(json.dumps(result))
 
   elif command == "delete-record" and len(sys.argv) >= 3:
     data = json.loads(sys.argv[2])
-    result = delete_record(data['zone'], data['name'])
+    result = delete_record(data['zone'], data['name'], data.get('type'),
+                           data.get('value'), data.get('deleteReverse', False))
     print(json.dumps(result))
 
   elif command == "get-zone-options" and len(sys.argv) >= 3:

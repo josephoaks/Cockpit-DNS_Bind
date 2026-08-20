@@ -12,6 +12,7 @@ import {
 } from '@patternfly/react-core';
 import { CheckCircleIcon } from '@patternfly/react-icons';
 import { spawnForwardersBackend } from '../utils/backend';
+import { isIpAddress } from '../utils/reverseZone';
 
 export const ForwardersPage = () => {
   const [loading, setLoading] = useState(true);
@@ -58,23 +59,7 @@ export const ForwardersPage = () => {
     }
   };
 
-  const validateIpFormat = (ip) => {
-    // IPv4 regex
-    const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
-    // IPv6 regex (simplified)
-    const ipv6Regex = /^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$/;
-    
-    if (ipv4Regex.test(ip)) {
-      // Validate each octet is 0-255
-      const octets = ip.split('.');
-      return octets.every(octet => {
-        const num = parseInt(octet, 10);
-        return num >= 0 && num <= 255;
-      });
-    }
-    
-    return ipv6Regex.test(ip);
-  };
+  const validateIpFormat = (ip) => isIpAddress(ip);
 
   const handleAddForwarder = async () => {
     const ip = newForwarderIp.trim();

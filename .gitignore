@@ -21,3 +21,6 @@ __pycache__/
 # Keep src/ and backend/
 !src/
 !backend/
+
+build-rpm.sh
+cockpit-dns-bind-*.tar.gz
