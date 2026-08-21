@@ -20,6 +20,8 @@ import { PlusIcon } from '@patternfly/react-icons';
 import { spawnBackend, spawnBindctl, reloadNotice } from '../utils/backend';
 import { reverseZonesFor, isDefaultZone } from '../utils/reverseZone';
 import { ZoneEditorPage } from './ZoneEditorPage';
+import { ZoneImportModal } from './ZoneImportModal';
+import { NamedConfEditor } from './NamedConfEditor';
 
 export const ZonesPage = () => {
   const [view, setView] = useState('list'); // 'list' or 'edit'
@@ -41,6 +43,8 @@ export const ZonesPage = () => {
   const [bindStatus, setBindStatus] = useState(null);
   const [reloading, setReloading] = useState(false);
   const [notice, setNotice] = useState(null);
+  const [isImportOpen, setIsImportOpen] = useState(false);
+  const [isConfOpen, setIsConfOpen] = useState(false);
 
   const reverseHint = reverseZonesFor(newZoneNetwork);
 
@@ -114,6 +118,22 @@ export const ZonesPage = () => {
     const name = newZoneName.trim();
     if (!name) {
       alert('Zone name is required');
+      return;
+    }
+
+    // A network typed into the Zone Name field is a common slip, and the two
+    // fields sit next to each other. Work out what they meant and offer it.
+    if (name.includes('/')) {
+      const derived = reverseZonesFor(name);
+      if (derived && derived.zones && derived.zones.length === 1) {
+        if (confirm(`${name} is a network, not a zone name.\n\n`
+          + `The reverse zone for it is ${derived.zones[0]}.\n\nUse that instead?`)) {
+          setNewZoneName(derived.zones[0]);
+        }
+        return;
+      }
+      alert(`${name} is a network, not a zone name. Use the reverse zone helper `
+        + `below the Zone Name field to work out the right name.`);
       return;
     }
 
@@ -255,6 +275,16 @@ export const ZonesPage = () => {
               </Button>
             </ToolbarItem>
             <ToolbarItem>
+              <Button variant="secondary" onClick={() => setIsImportOpen(true)}>
+                Import Zones
+              </Button>
+            </ToolbarItem>
+            <ToolbarItem>
+              <Button variant="secondary" onClick={() => setIsConfOpen(true)}>
+                Edit named.conf
+              </Button>
+            </ToolbarItem>
+            <ToolbarItem>
               <Button variant="secondary" onClick={handleReload} isDisabled={reloading}>
                 {reloading ? 'Reloading...' : 'Reload BIND'}
               </Button>
@@ -320,6 +350,19 @@ export const ZonesPage = () => {
       </table>
 
       {/* Add New Zone Modal */}
+      {isConfOpen && (
+        <NamedConfEditor
+          onClose={() => setIsConfOpen(false)}
+          onSaved={() => { loadZones(); loadBindStatus(); }}
+        />
+      )}
+
+      <ZoneImportModal
+        isOpen={isImportOpen}
+        onClose={() => setIsImportOpen(false)}
+        onImported={() => { loadZones(); loadBindStatus(); }}
+      />
+
       <Modal
         variant={ModalVariant.medium}
         title="Add New Zone"

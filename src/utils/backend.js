@@ -133,6 +133,35 @@ export function spawnBindctl(args) {
   });
 }
 
+// A zone file can run to thousands of records, well past ARG_MAX, so bulk
+// payloads go in on stdin rather than as an argv element.
+export function spawnBackendInput(args, input) {
+  return new Promise((resolve, reject) => {
+    const process = cockpit.spawn(['/usr/bin/python3', DNS_BACKEND_PATH, ...args], {
+      superuser: "require",
+      err: "out"
+    });
+
+    let stdout = "";
+
+    process.stream((data) => {
+      stdout += data;
+    });
+
+    process.input(input || "");
+
+    process.then(() => {
+      if (!stdout || stdout.trim() === "") {
+        reject(new Error("Backend returned empty output"));
+      } else {
+        resolve(stdout);
+      }
+    }).catch((err) => {
+      reject(new Error(err.message || "Backend failed"));
+    });
+  });
+}
+
 // Turn the `reload` block returned by a write into a message for the UI, or
 // null when everything applied cleanly and there is nothing to report.
 export function reloadNotice(result) {

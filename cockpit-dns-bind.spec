@@ -6,7 +6,7 @@
 # License: LGPL-2.1
 #
 Name:           cockpit-dns-bind
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Cockpit plugin for managing BIND DNS server
 License:        LGPL-2.1
@@ -33,13 +33,71 @@ Linux distributions.
 %install
 mkdir -p %{buildroot}/usr/share/cockpit
 cp -a dns-bind %{buildroot}/usr/share/cockpit/
+install -d -m 0700 %{buildroot}%{_sharedstatedir}/cockpit-dns-bind
+install -d -m 0700 %{buildroot}%{_sharedstatedir}/cockpit-dns-bind/backups
 
 %files
 %license LICENSE
 %doc README.md
 /usr/share/cockpit/dns-bind
+# Backups may contain a named.conf with inline TSIG secrets, and zone files
+# disclose internal network layout, so the directory is root-only and owned by
+# the package rather than being created at first write with an inherited umask.
+%dir %attr(0700, root, root) %{_sharedstatedir}/cockpit-dns-bind
+%dir %attr(0700, root, root) %{_sharedstatedir}/cockpit-dns-bind/backups
 
 %changelog
+* Fri Aug 21 2026 Joseph Oaks
+- Added: dynamic zones are now handled safely. A zone with allow-update or
+  update-policy is frozen before its file is edited and thawed afterwards, so
+  changes are no longer lost to the journal, and its records are synced from
+  the journal before being read so the list matches what is being served.
+- Added: a warning is shown when a zone accepts dynamic updates, and a comment
+  is written into its named.conf block noting that BIND owns the zone file.
+- Added: a Logging tab. Selected categories are sent to syslog at a chosen
+  severity and facility. A logging block written by hand is detected and
+  reported rather than replaced.
+- Added: a Backups tab. Every change is snapshotted first, and any version can
+  be previewed against the current file and restored. A backup is validated
+  before it is put back, and the file it replaces is itself backed up.
+- Added: SRV and CAA records can now be created and edited, using per-field
+  forms rather than raw record data.
+- Added: an editor for named.conf, with validation against named-checkconf
+  and known option values, automatic backup, and rollback if the file does
+  not load.
+- Changed: backups are stored in /var/lib/cockpit-dns-bind/backups as files
+  readable only by root, and are kept for ten versions or ninety days per file.
+- Fixed: record names are now written fully qualified. A name entered as
+  "host.example.com" without a trailing dot became host.example.com.example.com,
+  and a name outside the zone was accepted and then ignored by named.
+- Fixed: the domain name inside MX and SRV record data was qualified by
+  appending a dot to the whole value, which was correct only because the name
+  happens to come last.
+- Fixed: saving a zone's options repeatedly added a duplicate comment to its
+  named.conf block each time.
+
+* Thu Aug 20 2026 Joseph Oaks
+- Added: zone import. Upload the named.conf from an existing BIND server to
+  read its zone declarations, then attach the zone files and register the
+  zones locally.
+- Added: uploaded named.conf is validated with named-checkconf before being
+  parsed, and each uploaded zone file is validated with named-checkzone
+  before anything is written. A zone that fails validation is not imported
+  and its checkzone output is shown.
+- Added: the import review table lists every declared zone with its type and
+  expected file. Zones that ship with a stock named.conf are listed but not
+  selected, and secondary and forward zones import without a zone file.
+- Added: imported zones are given a current serial. The serial never moves
+  backwards, so secondaries following the source server are not left
+  believing they are up to date.
+- Added: imported zone files are rewritten in canonical form with
+  named-compilezone, so relative names are fully qualified and the stored
+  file matches the format this plugin writes.
+- Added: a zone that already exists locally is skipped unless replacing it is
+  explicitly selected, and the existing file is backed up first.
+- Changed: bulk payloads are passed to the backend on stdin rather than as a
+  command line argument, so zone files larger than ARG_MAX can be imported.
+
 * Thu Aug 20 2026 Joseph Oaks
 - Fixed an issue with deletion of records that were non-A records.
 - Fixed IPv6 reverse zones were filtered out of the zone list entirely,

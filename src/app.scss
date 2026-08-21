@@ -84,14 +84,24 @@
   transform: translate(-50%, -50%) !important;
   margin: 0 !important;
 
-  /* Constrain size */
-  width: 90vw !important;
-  max-width: 600px !important;
+  /* Constrain size.
+   *
+   * max-width is deliberately not forced here: a blanket cap overrides the
+   * PatternFly variant classes (pf-m-md, pf-m-lg) and the Modal width prop, so
+   * every modal in the app came out the same size no matter what it asked for.
+   * Variants set --pf-v6-c-modal-box--Width, which this respects. */
+  width: var(--pf-v6-c-modal-box--Width, 90vw) !important;
+  max-width: calc(100vw - 2rem) !important;
   max-height: 80vh !important;
 
   /* Flexbox layout */
   display: flex !important;
   flex-direction: column !important;
+}
+
+/* Modals that ask for no variant keep the old comfortable reading width. */
+.pf-v6-c-modal-box:not(.pf-m-sm):not(.pf-m-md):not(.pf-m-lg) {
+  max-width: 600px !important;
 }
 
 /* Ensure all modal parts are visible */
@@ -122,4 +132,129 @@
  * ------------------------- */
 .pf-v6-c-alert {
   margin-bottom: 1rem;
+}
+
+/* -------------------------
+ * named.conf editor
+ *
+ * Terminal-style full-screen editor. A config file is long enough that a modal
+ * textarea fights for room with the surrounding chrome; this gives the file the
+ * whole viewport and keeps the line gutter aligned with the text.
+ * ------------------------- */
+.dnsbind-editor-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: rgba(0, 0, 0, 0.65);
+}
+
+.dnsbind-editor-window {
+  display: flex;
+  flex-direction: column;
+  width: 94vw;
+  height: 92vh;
+  overflow: hidden;
+  font-family: var(--pf-t--global--font--family--mono, monospace);
+  background-color: var(--pf-t--global--background--color--primary--default, #1b1d21);
+  border: 1px solid var(--pf-t--global--border--color--default, #444548);
+  border-radius: 4px;
+}
+
+.dnsbind-editor-titlebar {
+  display: flex;
+  flex-shrink: 0;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8rem;
+  background-color: var(--pf-t--global--background--color--secondary--default, #292929);
+  border-bottom: 1px solid var(--pf-t--global--border--color--default, #444548);
+
+  &__path { font-weight: bold; }
+  &__modified { color: var(--pf-t--global--color--status--warning--default, #dca614); }
+  &__lines { margin-left: auto; color: var(--pf-t--global--text--color--subtle, #8a8d90); }
+}
+
+.dnsbind-editor-notices {
+  flex-shrink: 0;
+  max-height: 40vh;
+  padding: 0.75rem 0.75rem 0;
+  overflow-y: auto;
+  font-family: var(--pf-t--global--font--family--body, sans-serif);
+}
+
+.dnsbind-editor-body {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.dnsbind-editor-gutter {
+  flex-shrink: 0;
+  padding: 0.5rem 0.5rem 0.5rem 0.75rem;
+  overflow: hidden;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--pf-t--global--text--color--subtle, #8a8d90);
+  text-align: right;
+  user-select: none;
+  background-color: var(--pf-t--global--background--color--secondary--default, #292929);
+
+  &__line { white-space: pre; }
+  &__line.is-flagged {
+    font-weight: bold;
+    color: var(--pf-t--global--color--status--danger--default, #ee0000);
+  }
+}
+
+.dnsbind-editor-textarea {
+  flex: 1 1 auto;
+  padding: 0.5rem;
+  overflow: auto;
+  font-family: inherit;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  color: var(--pf-t--global--text--color--regular, #e0e0e0);
+  white-space: pre;
+  background-color: transparent;
+  border: 0;
+  resize: none;
+  tab-size: 8;
+
+  &:focus { outline: none; }
+}
+
+.dnsbind-editor-keys {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 1rem;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.75rem;
+  background-color: var(--pf-t--global--background--color--secondary--default, #292929);
+  border-top: 1px solid var(--pf-t--global--border--color--default, #444548);
+
+  &__entry { color: var(--pf-t--global--text--color--subtle, #8a8d90); }
+  &__key {
+    padding: 0 0.35rem;
+    margin-right: 0.4rem;
+    color: var(--pf-t--global--text--color--regular, #e0e0e0);
+    background-color: var(--pf-t--global--background--color--primary--default, #1b1d21);
+    border: 1px solid var(--pf-t--global--border--color--default, #444548);
+    border-radius: 2px;
+  }
+}
+
+.dnsbind-editor-prompt {
+  display: flex;
+  flex-shrink: 0;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+  background-color: var(--pf-t--global--color--status--warning--default, #dca614);
+  color: #151515;
 }

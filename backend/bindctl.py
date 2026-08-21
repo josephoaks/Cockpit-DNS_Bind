@@ -19,15 +19,18 @@ Two rules drive the design:
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote, unquote
 
 NAMED_CONF = "/etc/named.conf"
 BACKUP_DIR = "/var/lib/cockpit-dns-bind/backups"
 KEEP_BACKUPS = 10
+KEEP_DAYS = 90
 SERVICE = "named"
 
 
@@ -98,6 +101,33 @@ def check_zone(zone_name, zone_file):
 # Backup / restore
 # --------------------------------------------------------------------------
 
+_STAMP_SUFFIX = re.compile(r'\.(\d{8}-\d{6})\.(\d+)$')
+
+# Backups are flat files whose name is the percent-encoded absolute path of the
+# file they came from, plus a timestamp. Encoding rather than mirroring the
+# directory tree keeps the origin recoverable without recreating a filesystem
+# root inside the state directory.
+def _encode_origin(path):
+  return quote(str(path), safe='')
+
+
+def _decode_origin(name):
+  return unquote(name)
+
+
+def _ensure_backup_dir():
+  """Create the backup directory root-owned and private.
+
+  Backups can contain a named.conf with inline TSIG secrets, and zone files
+  disclose internal network layout, so neither the directory nor its contents
+  are readable by anyone but root.
+  """
+  root = Path(BACKUP_DIR)
+  root.mkdir(parents=True, exist_ok=True)
+  os.chmod(root, 0o700)
+  return root
+
+
 def snapshot(path):
   """Copy a file aside before it is modified. Returns the backup path or None.
 
@@ -108,22 +138,148 @@ def snapshot(path):
   if not src.exists():
     return None
   try:
-    Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+    root = _ensure_backup_dir()
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    dest = Path(BACKUP_DIR) / f"{src.name}.{stamp}.{os.getpid()}"
-    shutil.copy2(src, dest)
-    _prune(src.name)
+    dest = root / f"{_encode_origin(src.resolve())}.{stamp}.{os.getpid()}"
+    # copyfile rather than copy2: the source mode is 0644 and must not carry
+    # over to a file that may contain key material.
+    shutil.copyfile(src, dest)
+    os.chmod(dest, 0o600)
+    _prune(_encode_origin(src.resolve()))
     return str(dest)
   except Exception:
     # A failed backup must not block the edit; it only removes the safety net.
     return None
 
 
-def _prune(basename):
+def original_path_of(backup_path):
+  """The file a backup was taken from, or None if the path is not a backup."""
   try:
-    kept = sorted(Path(BACKUP_DIR).glob(f"{basename}.*"), reverse=True)
-    for old in kept[KEEP_BACKUPS:]:
-      old.unlink(missing_ok=True)
+    entry = Path(backup_path).resolve()
+    entry.relative_to(Path(BACKUP_DIR).resolve())
+  except Exception:
+    return None
+  m = _STAMP_SUFFIX.search(entry.name)
+  if not m:
+    return None
+  origin = _decode_origin(entry.name[:m.start()])
+  # An encoded name always decodes to an absolute path; anything else means the
+  # file was not written by snapshot().
+  return origin if origin.startswith('/') else None
+
+
+def list_backups():
+  """Every backup on disk, newest first, grouped by the file it came from."""
+  root = Path(BACKUP_DIR)
+  if not root.exists():
+    return []
+
+  by_origin = {}
+  for entry in root.iterdir():
+    if not entry.is_file():
+      continue
+    origin = original_path_of(entry)
+    if not origin:
+      continue
+    m = _STAMP_SUFFIX.search(entry.name)
+    stat = entry.stat()
+    by_origin.setdefault(origin, []).append({
+      "backup": str(entry),
+      "taken": m.group(1),
+      "size": stat.st_size,
+      "mtime": int(stat.st_mtime),
+    })
+
+  out = []
+  for origin, versions in sorted(by_origin.items()):
+    versions.sort(key=lambda v: v["mtime"], reverse=True)
+    out.append({"path": origin, "exists": Path(origin).exists(), "versions": versions})
+  return out
+
+
+def read_backup(backup_path):
+  """Contents of one backup, for previewing before a restore."""
+  origin = original_path_of(backup_path)
+  if not origin:
+    return {"error": "That path is not inside the backup directory"}
+  try:
+    with open(backup_path, 'r') as f:
+      content = f.read()
+  except Exception as e:
+    return {"error": f"Could not read the backup: {e}"}
+
+  current = ""
+  if Path(origin).exists():
+    try:
+      with open(origin, 'r') as f:
+        current = f.read()
+    except Exception:
+      current = ""
+  return {"success": True, "path": origin, "content": content, "current": current}
+
+
+def restore_backup(backup_path, zone_name=None):
+  """Put a backup back, validating it first.
+
+  Restoring is itself a change worth undoing, so the file being replaced is
+  snapshotted before it is overwritten. The restored content is validated in
+  place and rolled back if it does not load, because a backup is not
+  automatically good -- it may predate a fix, or have been taken from a file
+  that was already broken.
+  """
+  origin = original_path_of(backup_path)
+  if not origin:
+    return {"error": "That path is not inside the backup directory"}
+  if not Path(backup_path).exists():
+    return {"error": "That backup no longer exists"}
+
+  is_conf = os.path.abspath(origin) == os.path.abspath(NAMED_CONF)
+
+  # Validate the backup before it goes anywhere near the live file.
+  if is_conf:
+    ok, msg = check_conf(backup_path)
+  elif zone_name:
+    ok, msg = check_zone(zone_name, backup_path)
+  else:
+    ok, msg = True, ""
+  if not ok:
+    return {"error": "That backup does not pass validation, so it was not restored.",
+            "detail": msg}
+
+  undo = snapshot(origin) if Path(origin).exists() else None
+  try:
+    shutil.copy2(backup_path, origin)
+  except Exception as e:
+    return {"error": f"Could not write {origin}: {e}"}
+
+  if is_conf:
+    err = verify_conf_or_restore(undo, origin)
+    if err:
+      return {"error": err}
+    return {"success": True, "path": origin, "undo": undo, "reload": reconfig()}
+
+  if zone_name:
+    ok, msg = check_zone(zone_name, origin)
+    if not ok:
+      restore(undo, origin)
+      return {"error": f"Restore rejected and the previous file was put back. {msg}"}
+    return {"success": True, "path": origin, "undo": undo,
+            "reload": reload_zone(zone_name)}
+
+  return {"success": True, "path": origin, "undo": undo, "reload": reconfig()}
+
+
+def _prune(encoded_origin):
+  """Keep the most recent KEEP_BACKUPS copies of one file, and drop anything
+  older than KEEP_DAYS regardless of count, so the directory cannot grow without
+  bound on a busy server."""
+  try:
+    root = Path(BACKUP_DIR)
+    kept = sorted(root.glob(f"{encoded_origin}.*"), reverse=True)
+    cutoff = time.time() - (KEEP_DAYS * 86400)
+    for i, old in enumerate(kept):
+      if i >= KEEP_BACKUPS or old.stat().st_mtime < cutoff:
+        old.unlink(missing_ok=True)
   except Exception:
     pass
 
@@ -139,6 +295,52 @@ def restore(backup_path, target):
     return False
 
 
+def zone_is_dynamic(zone_name):
+  """Is this zone under BIND's control via dynamic update?
+
+  Asked of the running server rather than inferred from named.conf, because
+  `rndc zonestatus` is authoritative and covers both allow-update and
+  update-policy. With named down there is no journal to conflict with, so a
+  direct file edit is safe and this reports False.
+  """
+  if not named_running():
+    return False
+  usable, _ = rndc_usable()
+  if not usable:
+    return False
+  rc, out = _run(["rndc", "zonestatus", zone_name])
+  if rc != 0:
+    return False
+  return re.search(r'^\s*dynamic:\s*yes\s*$', out, re.MULTILINE | re.IGNORECASE) is not None
+
+
+def freeze_zone(zone_name):
+  """Suspend dynamic updates and flush the journal to the zone file.
+
+  Editing the file of a dynamic zone without this loses the change: BIND holds
+  pending updates in a .jnl journal and will overwrite or ignore whatever was
+  written underneath it.
+  """
+  rc, out = _run(["rndc", "freeze", zone_name])
+  return rc == 0, out
+
+
+def thaw_zone(zone_name):
+  """Resume dynamic updates. This reloads the zone, so no separate reload."""
+  rc, out = _run(["rndc", "thaw", zone_name])
+  return rc == 0, out
+
+
+def sync_zone(zone_name):
+  """Write pending journal entries out to the zone file.
+
+  Used before reading a dynamic zone so the records shown match what is being
+  served rather than the last on-disk state.
+  """
+  rc, out = _run(["rndc", "sync", zone_name])
+  return rc == 0, out
+
+
 def guard(zone_name, zone_file):
   """Snapshot a zone file and record whether it was already valid.
 
@@ -149,8 +351,20 @@ def guard(zone_name, zone_file):
   later failure is attributable to this change.
   """
   ok, _ = check_zone(zone_name, zone_file)
+
+  # A dynamic zone must be frozen before its file is touched, and the freeze
+  # flushes the journal so what we then read and rewrite is current.
+  frozen = False
+  freeze_error = None
+  if zone_is_dynamic(zone_name):
+    frozen, msg = freeze_zone(zone_name)
+    if not frozen:
+      freeze_error = msg or f"Could not freeze {zone_name}"
+
   return {"zone": zone_name, "file": zone_file,
-          "backup": snapshot(zone_file), "was_valid": ok}
+          "backup": snapshot(zone_file), "was_valid": ok,
+          "dynamic": frozen or freeze_error is not None,
+          "frozen": frozen, "freezeError": freeze_error}
 
 
 def verify_or_restore(g):
@@ -187,6 +401,31 @@ def verify_conf_or_restore(backup_path, conf_path=None):
 # --------------------------------------------------------------------------
 # Reload
 # --------------------------------------------------------------------------
+
+def normalize_zone(zone_name, zone_file):
+  """Rewrite a zone file in canonical form. Returns (ok, message).
+
+  named-compilezone expands $ORIGIN, fully qualifies relative names, and
+  canonicalizes whitespace, so an imported zone ends up in the same shape the
+  plugin writes and the zone parser sees something predictable. The stored file
+  will not match the admin's original byte for byte, which is why callers say
+  so in their result.
+  """
+  if not _have("named-compilezone"):
+    return False, "named-compilezone is not installed; the zone was stored as uploaded"
+  out_path = f"{zone_file}.normalized"
+  rc, out = _run(["named-compilezone", "-f", "text", "-F", "text",
+                  "-o", out_path, zone_name, zone_file])
+  if rc != 0:
+    Path(out_path).unlink(missing_ok=True)
+    return False, out
+  try:
+    shutil.move(out_path, zone_file)
+  except Exception as e:
+    Path(out_path).unlink(missing_ok=True)
+    return False, str(e)
+  return True, ""
+
 
 def _service_reload(reason):
   rc, out = _run(["systemctl", "reload", SERVICE])
@@ -252,6 +491,13 @@ def main():
     print(json.dumps(reload_zone(sys.argv[2] if len(sys.argv) > 2 else None)))
   elif cmd == "reconfig":
     print(json.dumps(reconfig()))
+  elif cmd == "list-backups":
+    print(json.dumps(list_backups()))
+  elif cmd == "read-backup" and len(sys.argv) >= 3:
+    print(json.dumps(read_backup(sys.argv[2])))
+  elif cmd == "restore-backup" and len(sys.argv) >= 3:
+    print(json.dumps(restore_backup(sys.argv[2],
+                                    sys.argv[3] if len(sys.argv) > 3 else None)))
   elif cmd == "check-conf":
     ok, msg = check_conf()
     print(json.dumps({"ok": ok, "message": msg}))

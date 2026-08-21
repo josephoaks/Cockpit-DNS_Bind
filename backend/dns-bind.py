@@ -8,14 +8,49 @@ import json
 import sys
 import re
 import ipaddress
+import os
+import shutil
+import tempfile
 
 import bindctl
+
+# dns-bind.py and bindctl.py are installed together and must be updated
+# together. A partial deployment otherwise surfaces as an opaque traceback from
+# whichever call happens to reach a missing helper first.
+for _required in ("guard", "verify_or_restore", "zone_is_dynamic", "freeze_zone",
+                  "thaw_zone", "sync_zone", "reload_zone", "reconfig", "snapshot"):
+  if not hasattr(bindctl, _required):
+    raise SystemExit(json.dumps({
+      "error": f"backend/bindctl.py is out of date: it has no {_required}(). "
+               f"Reinstall the plugin so both backend files come from the same "
+               f"version."}))
 from pathlib import Path
 from datetime import datetime
 
 NAMED_CONF = "/etc/named.conf"
 NAMED_D_DIR = "/etc/named.d"
 ZONES_BASE = "/var/lib/named"
+
+
+def _is_default_zone(name):
+  """Zones a stock named.conf ships with, which an import should not bring over.
+
+  Mirrors isDefaultZone() in src/utils/reverseZone.js. The IPv6 test covers both
+  loopback forms and is not pinned to an exact nibble count, because SLES
+  declares that zone with 31 nibbles rather than 32.
+  """
+  n = (name or "").strip().rstrip('.').lower()
+  if not n or n == '.':
+    return True
+  if n in ('localhost', 'localhost.localdomain'):
+    return True
+  if re.search(r'(^|\.)127\.in-addr\.arpa$', n):
+    return True
+  if n in ('0.in-addr.arpa', '255.in-addr.arpa', '0.ip6.arpa'):
+    return True
+  if re.fullmatch(r'[01](\.0){27,31}\.ip6\.arpa', n):
+    return True
+  return False
 
 
 def _validate_zone_name(zone_name):
@@ -475,38 +510,50 @@ def read_mx_records(zone_file):
 
 
 def increment_serial(zone_file):
-  """Increment the serial number in a zone file"""
-  # Read the file
+  """Increment the serial in a zone file's SOA record.
+
+  The serial is located through the zone parser rather than by looking for a
+  '; serial' comment. Zones this plugin did not write -- hand-maintained ones,
+  anything normalized by named-compilezone, output from other tooling -- carry
+  no such comment, and keying on it meant their serial silently never moved and
+  secondaries stopped seeing updates.
+  """
+  soa = next((rr for rr in _iter_rrs(zone_file) if rr["type"] == "SOA"), None)
+  if not soa:
+    return None
+
+  # SOA rdata is: MNAME RNAME serial refresh retry expiry minimum
+  parts = soa["value"].split()
+  if len(parts) < 3 or not parts[2].isdigit():
+    return None
+  old_serial = int(parts[2])
+
+  today_int = int(datetime.now().strftime('%Y%m%d') + '00')
+  if today_int <= old_serial < today_int + 100:
+    new_serial = old_serial + 1
+  elif old_serial >= today_int + 100:
+    # Already ahead of today; keep moving forward rather than going backwards,
+    # since a serial that decreases stops zone transfers.
+    new_serial = old_serial + 1
+  else:
+    new_serial = today_int
+
   with open(zone_file, 'r') as f:
-    content = f.read()
+    lines = f.readlines()
 
-  # Find the serial line
-  serial_pattern = r'(\d{10})\s*;\s*serial'
-  match = re.search(serial_pattern, content, re.IGNORECASE)
+  # Replace the serial in place so the file's formatting is preserved.
+  pattern = re.compile(rf'(?<![\d.]){old_serial}(?![\d.])')
+  for i in range(soa["start"], min(soa["end"] + 1, len(lines))):
+    if pattern.search(lines[i]):
+      lines[i] = pattern.sub(str(new_serial), lines[i], count=1)
+      break
+  else:
+    return None
 
-  if match:
-    old_serial = int(match.group(1))
-    # Generate new serial: YYYYMMDDNN format
-    today = datetime.now().strftime('%Y%m%d')
-    today_int = int(today + '00')
+  with open(zone_file, 'w') as f:
+    f.writelines(lines)
 
-    # If serial is from today, increment the last 2 digits
-    if old_serial >= today_int and old_serial < today_int + 100:
-      new_serial = old_serial + 1
-    else:
-      # Start fresh for new day
-      new_serial = today_int
-
-    # Replace serial in content
-    content = re.sub(serial_pattern, f'{new_serial}\t\t; serial', content, flags=re.IGNORECASE)
-
-    # Write back
-    with open(zone_file, 'w') as f:
-      f.write(content)
-
-    return new_serial
-
-  return None
+  return new_serial
 
 
 def update_soa(zone_name, soa_data):
@@ -556,13 +603,35 @@ def _commit_zone(guard, result):
 
   Returns either an error dict or the result dict with reload status attached.
   """
+  # A zone frozen for editing must be thawed on every path out of here,
+  # including the failure paths -- leaving it frozen silently stops dynamic
+  # updates, so DHCP or AD clients quietly stop registering.
+  def finish(payload):
+    if guard.get("frozen"):
+      ok, msg = bindctl.thaw_zone(guard["zone"])
+      if ok:
+        # thaw reloads the zone itself, so no separate reload is needed.
+        payload.setdefault("reload", {"status": "reloaded", "via": "rndc",
+                                      "message": f"rndc thaw {guard['zone']} succeeded"})
+      else:
+        payload["thawFailed"] = (
+          f"{guard['zone']} could not be thawed and is still frozen, so dynamic "
+          f"updates to it are being refused. Run: rndc thaw {guard['zone']}. "
+          f"{msg}")
+    return payload
+
+  if guard.get("freezeError"):
+    return finish({"error": f"Could not prepare {guard['zone']} for editing: "
+                            f"{guard['freezeError']}"})
+
   err, warning = bindctl.verify_or_restore(guard)
   if err:
-    return {"error": err}
+    return finish({"error": err})
   if warning:
     result["warning"] = warning
-  result["reload"] = bindctl.reload_zone(guard["zone"])
-  return result
+  if not guard.get("frozen"):
+    result["reload"] = bindctl.reload_zone(guard["zone"])
+  return finish(result)
 
 
 def _reverse_fqdn(ip_value):
@@ -588,6 +657,79 @@ def _find_reverse_zone(reverse_fqdn, zones):
   return best
 
 
+def _canonical_owner(name, zone_name):
+  """Return (fqdn, error) for a record owner name.
+
+  Owner names are written fully qualified. That matches what yast2-dns-server
+  wrote, what named-compilezone produces on import, and what the PTR writer
+  already does, so a zone file does not end up half one style and half another.
+
+  It also closes a double-suffix trap: a name typed as "www.example.com" without
+  the trailing dot is relative by zone file rules and becomes
+  www.example.com.example.com. Someone typing the zone into the name field means
+  the fully qualified name, so that case is detected rather than obeyed.
+  """
+  raw = (name or "").strip()
+  if not raw:
+    return None, "Record name is required"
+
+  base = zone_name.rstrip('.').lower()
+
+  if raw == '@':
+    return base + '.', None
+
+  if raw.endswith('.'):
+    fqdn = raw
+  else:
+    lowered = raw.lower()
+    if lowered == base or lowered.endswith('.' + base):
+      # Fully qualified but missing the trailing dot.
+      fqdn = raw + '.'
+    else:
+      fqdn = f"{raw}.{base}."
+
+  label_part = fqdn[:-1]
+  if not re.fullmatch(r'(\*|[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?)'
+                      r'(\.(\*|[A-Za-z0-9_](?:[A-Za-z0-9_-]*[A-Za-z0-9_])?))*',
+                      label_part):
+    return None, f"{raw} is not a valid record name"
+
+  if not (fqdn.lower() == base + '.' or fqdn.lower().endswith('.' + base + '.')):
+    return None, (f"{fqdn} is not inside {zone_name}. A zone can only hold "
+                  f"records for names within it.")
+
+  return fqdn, None
+
+
+def _qualify_rdata(record_type, value):
+  """Add the trailing dot to the domain name inside a record's rdata.
+
+  Which token holds the name depends on the type: SRV puts it fourth after
+  priority, weight and port; MX puts it second after the preference. Qualifying
+  the whole string happens to work when the name is last, but breaks on a root
+  target of "." and would corrupt anything with trailing fields.
+  """
+  v = (value or "").strip()
+  if record_type in ("CNAME", "PTR", "DNAME", "NS"):
+    return _qualify(v)
+  if record_type == "MX":
+    parts = v.split()
+    if len(parts) == 2:
+      return f"{parts[0]} {_qualify(parts[1])}"
+    return v
+  if record_type == "SRV":
+    parts = v.split()
+    if len(parts) == 4 and parts[3] != '.':
+      return f"{parts[0]} {parts[1]} {parts[2]} {_qualify(parts[3])}"
+    return v
+  return v
+
+
+# Types whose rdata contains a domain name needing the same trailing-dot
+# treatment as an owner name.
+_NAME_VALUED = ("CNAME", "PTR", "DNAME", "NS", "MX", "SRV")
+
+
 def _validate_rdata(record_type, value):
   """Reject rdata that would stop the zone loading. Returns an error or None.
 
@@ -610,6 +752,27 @@ def _validate_rdata(record_type, value):
         return f"{v} is an IPv4 address; use an A record"
     except ValueError:
       return f"{v} is not a valid IPv6 address"
+  elif record_type == "SRV":
+    # priority weight port target
+    parts = v.split()
+    if len(parts) != 4:
+      return "An SRV value must be: priority weight port target"
+    for label, num in zip(("priority", "weight", "port"), parts[:3]):
+      if not num.isdigit() or not 0 <= int(num) <= 65535:
+        return f"SRV {label} must be a number between 0 and 65535"
+    if not re.fullmatch(r'[A-Za-z0-9_*\-./]+', parts[3]):
+      return f"{parts[3]} is not a valid SRV target"
+  elif record_type == "CAA":
+    # flags tag "value"
+    parts = v.split(None, 2)
+    if len(parts) != 3:
+      return 'A CAA value must be: flags tag "value"'
+    if not parts[0].isdigit() or not 0 <= int(parts[0]) <= 255:
+      return "CAA flags must be a number between 0 and 255"
+    if not re.fullmatch(r'[A-Za-z0-9]+', parts[1]):
+      return "A CAA tag must be alphanumeric, such as issue or issuewild"
+    if not (parts[2].startswith('"') and parts[2].endswith('"') and len(parts[2]) >= 2):
+      return 'The CAA value must be in double quotes, such as "letsencrypt.org"'
   elif record_type in ("CNAME", "PTR", "DNAME"):
     if any(c.isspace() for c in v):
       return f"A {record_type} value must be a single domain name"
@@ -829,6 +992,13 @@ def add_record(zone_name, record_name, record_type, record_value, create_ptr=Fal
     return {"error": f"Zone {zone_name} not found"}
 
   zone_file = zone['file']
+
+  owner, name_err = _canonical_owner(record_name, zone_name)
+  if name_err:
+    return {"error": name_err}
+  if record_type in _NAME_VALUED:
+    record_value = _qualify_rdata(record_type, record_value)
+
   guard = bindctl.guard(zone_name, zone_file)
 
   err = _validate_rdata(record_type, record_value)
@@ -837,19 +1007,19 @@ def add_record(zone_name, record_name, record_type, record_value, create_ptr=Fal
 
   # An exact duplicate is an error; the same name may legitimately carry several
   # records (round-robin A, an A alongside a TXT, and so on).
-  if _find_rrs(zone_file, zone_name, name=record_name, rtype=record_type, value=record_value):
-    return {"error": f"Record {record_name} {record_type} {record_value} already exists"}
+  if _find_rrs(zone_file, zone_name, name=owner, rtype=record_type, value=record_value):
+    return {"error": f"Record {owner} {record_type} {record_value} already exists"}
 
   # A name holding a CNAME cannot hold any other data (RFC 1034 3.6.2).
-  siblings = _find_rrs(zone_file, zone_name, name=record_name)
+  siblings = _find_rrs(zone_file, zone_name, name=owner)
   if record_type == 'CNAME' and siblings:
-    return {"error": f"{record_name} already has records; a CNAME cannot coexist with other data"}
+    return {"error": f"{owner} already has records; a CNAME cannot coexist with other data"}
   if any(rr['type'] == 'CNAME' for rr in siblings):
-    return {"error": f"{record_name} is a CNAME; it cannot also hold a {record_type} record"}
+    return {"error": f"{owner} is a CNAME; it cannot also hold a {record_type} record"}
 
   # Add the record
   with open(zone_file, 'a') as f:
-    f.write(f"{record_name}\t\tIN {record_type}\t{record_value}\n")
+    f.write(f"{owner}\t\tIN {record_type}\t{record_value}\n")
 
   # Increment serial
   new_serial = increment_serial(zone_file)
@@ -858,7 +1028,7 @@ def add_record(zone_name, record_name, record_type, record_value, create_ptr=Fal
   if "error" in result:
     return result
   if create_ptr and record_type in ("A", "AAAA"):
-    result["ptr"] = _create_ptr_record(record_name, record_value, zone_name, zones,
+    result["ptr"] = _create_ptr_record(owner, record_value, zone_name, zones,
                                        force=force_ptr,
                                        create_zone_if_missing=create_reverse_zone)
   return result
@@ -888,6 +1058,13 @@ def update_record(zone_name, old_record_name, new_record_name, record_type, reco
     return {"error": f"Zone {zone_name} not found"}
 
   zone_file = zone['file']
+
+  new_owner, name_err = _canonical_owner(new_record_name, zone_name)
+  if name_err:
+    return {"error": name_err}
+  if record_type in _NAME_VALUED:
+    record_value = _qualify_rdata(record_type, record_value)
+
   guard = bindctl.guard(zone_name, zone_file)
 
   err = _validate_rdata(record_type, record_value)
@@ -903,7 +1080,7 @@ def update_record(zone_name, old_record_name, new_record_name, record_type, reco
                      f"cannot tell which to update"}
 
   _splice_lines(zone_file, [(hits[0]['start'], hits[0]['end'])],
-                replacement=f"{new_record_name}\t\tIN {record_type}\t{record_value}\n")
+                replacement=f"{new_owner}\t\tIN {record_type}\t{record_value}\n")
 
   # Increment serial
   new_serial = increment_serial(zone_file)
@@ -1068,6 +1245,14 @@ def get_zone_details(zone_name):
 
   for zone in zones:
     if zone["name"] == zone_name:
+      # Whether a zone is dynamic is advisory. It depends on rndc reaching a
+      # running server, so it must never be the reason a zone fails to load.
+      try:
+        zone["dynamic"] = bindctl.zone_is_dynamic(zone_name)
+        if zone["dynamic"]:
+          bindctl.sync_zone(zone_name)
+      except Exception:
+        zone["dynamic"] = False
       zone["records"] = read_zone_records(zone.get("file"))
       zone["mx_records"] = read_mx_records(zone.get("file"))
       zone["ns_records"] = read_ns_records(zone.get("file"))
@@ -1175,8 +1360,18 @@ def update_zone_options(zone_name, options):
     i = after
   zone_content = "".join(kept)
 
+  # Drop any marker comment we previously added, so re-saving does not stack up
+  # copies of it alongside the statements it describes.
+  zone_content = re.sub(r'^[ \t]*#[ \t]*Dynamic updates are enabled\..*$\n?',
+                        '', zone_content, flags=re.MULTILINE)
+
   new_options = []
   if options.get('allowDynamicUpdates') and options.get('tsigKey'):
+    # A marker in named.conf rather than in the zone file: BIND rewrites a
+    # dynamic zone's file when it flushes the journal, so a header comment there
+    # would not survive. This block is never rewritten by named.
+    new_options.append('\t# Dynamic updates are enabled. BIND owns this zone file;'
+                       ' edit records through Cockpit or nsupdate, not by hand.')
     new_options.append(f'\tallow-update {{ key "{options["tsigKey"]}"; }};')
   if options.get('enableZoneTransport'):
     acls = options.get('acls', [])
@@ -1274,6 +1469,503 @@ def delete_ns_record(zone_name, record_name, nameserver):
   return _commit_zone(guard, {"success": True, "serial": new_serial})
 
 
+# ---------------------------------------------------------------------------
+# Zone import
+#
+# Migrating off yast2-dns-server means moving zones onto a new box. The uploaded
+# named.conf is the manifest: it carries the authoritative zone name, the type,
+# and for secondaries the primaries list, none of which a zone file alone can
+# supply.
+# ---------------------------------------------------------------------------
+
+def _read_stdin():
+  """Bulk payloads arrive on stdin; a zone file can exceed ARG_MAX."""
+  return sys.stdin.read()
+
+
+def _addresses_in_clause(conf_text, zone_name, keywords):
+  """Pull the addresses out of a primaries/masters/forwarders clause.
+
+  Scoped to the named zone's own block so a clause in options or in a
+  neighbouring zone is not picked up by mistake.
+  """
+  header = re.compile(rf'zone\s+"{re.escape(zone_name)}"\s+(?:in\s+)?\{{',
+                      re.IGNORECASE)
+  m = header.search(conf_text)
+  if not m:
+    return []
+  block, _ = _extract_block(conf_text, conf_text.index('{', m.start()))
+
+  for kw in keywords:
+    hit = re.search(rf'\b{kw}\s*\{{', block, re.IGNORECASE)
+    if not hit:
+      continue
+    inner, _ = _extract_block(block, block.index('{', hit.start()))
+    found = []
+    for token in inner.replace('\n', ' ').split(';'):
+      token = token.strip()
+      if not token:
+        continue
+      # Entries may carry a port or key; only the address is needed here.
+      addr = token.split()[0]
+      try:
+        ipaddress.ip_address(addr)
+      except ValueError:
+        continue
+      found.append(addr)
+    if found:
+      return found
+  return []
+
+
+def import_parse_conf(conf_text):
+  """Read the zone declarations out of an uploaded named.conf.
+
+  named-checkconf is advisory here, not a gate. A config from another server
+  routinely fails it on this machine for reasons that have nothing to do with
+  its zones: `include` directives point at paths that do not exist here, and
+  statements such as `forward only;` depend on a `forwarders` clause supplied by
+  one of those includes. Refusing to parse on that basis would reject most real
+  configurations. The zone blocks are extracted regardless, and the checkconf
+  output is passed along so the admin can judge it.
+  """
+  local = {z['name'].rstrip('.').lower() for z in read_zones()}
+
+  # Includes are not followed: they reference the source server's filesystem.
+  # Zones defined inside them will not appear below, so say so.
+  includes = re.findall(r'^\s*include\s+"([^"]+)"\s*;', conf_text, re.MULTILINE)
+
+  with tempfile.NamedTemporaryFile('w', suffix='.conf', delete=False) as tmp:
+    tmp.write(conf_text)
+    tmp_path = tmp.name
+
+  try:
+    ok, msg = bindctl.check_conf(tmp_path)
+
+    zones = []
+    conf_body = conf_text
+    for z in parse_named_conf(tmp_path):
+      name = z['name']
+      name_err = _validate_zone_name(name)
+      # Only a primary holds locally authored data. A secondary transfers its
+      # contents and a forward zone has none at all.
+      needs_file = z['type'] == 'Primary'
+      entry = {
+        "name": name,
+        "type": z['type'],
+        "sourceFile": z.get('file'),
+        "needsFile": needs_file,
+        "isDefault": _is_default_zone(name),
+        "existsLocally": name.rstrip('.').lower() in local,
+        "invalid": name_err,
+      }
+      # A secondary is defined by where it transfers from and a forward zone by
+      # where it sends queries. Without these the zone cannot be recreated, so
+      # they have to travel with the manifest.
+      if z['type'] == 'Secondary':
+        entry['primaries'] = _addresses_in_clause(conf_body, name,
+                                                  ('primaries', 'masters'))
+      elif z['type'] == 'Forward':
+        entry['forwarders'] = _addresses_in_clause(conf_body, name, ('forwarders',))
+      zones.append(entry)
+
+    if not zones:
+      return {"error": "No zone declarations were found in that file.",
+              "detail": msg if not ok else ""}
+
+    return {"success": True, "zones": zones, "includes": includes,
+            "confValid": ok, "confMessage": "" if ok else msg}
+  finally:
+    Path(tmp_path).unlink(missing_ok=True)
+
+
+def import_validate_zone(zone_name, content):
+  """Check an uploaded zone file against the origin named.conf declares."""
+  name_err = _validate_zone_name(zone_name)
+  if name_err:
+    return {"ok": False, "message": name_err}
+
+  with tempfile.NamedTemporaryFile('w', suffix='.zone', delete=False) as tmp:
+    tmp.write(content)
+    tmp_path = tmp.name
+  try:
+    ok, msg = bindctl.check_zone(zone_name, tmp_path)
+    return {"ok": ok, "message": msg}
+  finally:
+    Path(tmp_path).unlink(missing_ok=True)
+
+
+def import_zone(meta, content):
+  """Register one zone from an import. Validates before anything is written."""
+  zone_name = (meta.get('name') or '').strip()
+  zone_type = meta.get('type') or 'Primary'
+  replace = bool(meta.get('replace'))
+  normalize = meta.get('normalize', True)
+
+  name_err = _validate_zone_name(zone_name)
+  if name_err:
+    return {"zone": zone_name, "error": name_err}
+
+  existing = next((z for z in read_zones() if z['name'] == zone_name), None)
+  if existing and not replace:
+    return {"zone": zone_name,
+            "error": f"{zone_name} already exists locally; not replaced"}
+
+  if zone_type != 'Primary':
+    # Nothing to write: a secondary's contents arrive by transfer and a forward
+    # zone has none. Register the declaration and stop.
+    if existing:
+      return {"zone": zone_name, "error": f"{zone_name} already exists locally"}
+    if zone_type == 'Secondary':
+      result = create_zone(zone_name, 'Secondary', None, None,
+                           primaries=meta.get('primaries') or [])
+    else:
+      result = create_zone(zone_name, 'Forward', None, None,
+                           forwarders=meta.get('forwarders') or [])
+    if 'error' in result:
+      return {"zone": zone_name, "error": result['error']}
+    return {"zone": zone_name, "imported": True, "type": zone_type,
+            "reload": result.get('reload')}
+
+  if not content or not content.strip():
+    return {"zone": zone_name, "error": "No zone file was supplied"}
+
+  # Validate before touching anything the server reads.
+  with tempfile.NamedTemporaryFile('w', suffix='.zone', delete=False) as tmp:
+    tmp.write(content)
+    tmp_path = tmp.name
+  try:
+    ok, msg = bindctl.check_zone(zone_name, tmp_path)
+    if not ok:
+      return {"zone": zone_name, "error": "The zone file did not pass named-checkzone",
+              "detail": msg}
+
+    notes = []
+    if normalize:
+      norm_ok, norm_msg = bindctl.normalize_zone(zone_name, tmp_path)
+      notes.append("Rewritten in canonical form by named-compilezone"
+                   if norm_ok else norm_msg)
+
+    # Give the imported zone a current serial. This never moves the number
+    # backwards: if the source is somehow ahead of today's date it goes to
+    # source + 1 instead. A serial lower than what secondaries already hold
+    # would leave them convinced they are current and serving stale data.
+    new_serial = increment_serial(tmp_path)
+    if new_serial:
+      notes.append(f"Serial set to {new_serial}")
+
+    zone_file = f"{ZONES_BASE}/master/{zone_name}"
+    Path(f"{ZONES_BASE}/master").mkdir(parents=True, exist_ok=True)
+    backup = bindctl.snapshot(zone_file) if Path(zone_file).exists() else None
+
+    shutil.copyfile(tmp_path, zone_file)
+    os.chmod(zone_file, 0o644)
+  finally:
+    Path(tmp_path).unlink(missing_ok=True)
+
+  if existing:
+    # Already declared in named.conf; only the contents changed.
+    return {"zone": zone_name, "imported": True, "replaced": True,
+            "backup": backup, "notes": notes,
+            "reload": bindctl.reload_zone(zone_name)}
+
+  conf_backup = bindctl.snapshot(NAMED_CONF)
+  try:
+    with open(NAMED_CONF, 'a') as f:
+      f.write(f"\nzone \"{zone_name}\" in {{\n\ttype master;\n"
+              f"\tfile \"master/{zone_name}\";\n}};\n")
+  except Exception as e:
+    Path(zone_file).unlink(missing_ok=True)
+    return {"zone": zone_name, "error": f"Failed to update named.conf: {e}"}
+
+  err = bindctl.verify_conf_or_restore(conf_backup, NAMED_CONF)
+  if err:
+    Path(zone_file).unlink(missing_ok=True)
+    return {"zone": zone_name, "error": err}
+
+  return {"zone": zone_name, "imported": True, "notes": notes,
+          "reload": bindctl.reconfig()}
+
+
+# ---------------------------------------------------------------------------
+# Raw named.conf editing
+#
+# The file is read and written verbatim. Stripping comments for display would
+# destroy them on save, and a stock SUSE named.conf is mostly documentation --
+# including commented-out settings people uncomment later.
+# ---------------------------------------------------------------------------
+
+def read_named_conf():
+  """Return the live named.conf as text."""
+  try:
+    with open(NAMED_CONF, 'r') as f:
+      return {"success": True, "path": NAMED_CONF, "content": f.read()}
+  except Exception as e:
+    return {"error": f"Could not read {NAMED_CONF}: {e}"}
+
+
+def write_named_conf(content):
+  """Validate and install a new named.conf, restoring the old one on failure."""
+  if not content or not content.strip():
+    return {"error": "Refusing to write an empty named.conf"}
+
+  problems = _lint_named_conf(content)
+
+  backup = bindctl.snapshot(NAMED_CONF)
+  try:
+    with open(NAMED_CONF, 'w') as f:
+      f.write(content)
+  except Exception as e:
+    return {"error": f"Could not write {NAMED_CONF}: {e}"}
+
+  err = bindctl.verify_conf_or_restore(backup, NAMED_CONF)
+  if err:
+    return {"error": err, "backup": backup}
+
+  return {"success": True, "backup": backup, "warnings": problems,
+          "reload": bindctl.reconfig()}
+
+
+# Known options and the shape their values take. named.conf accepts far more
+# than this, so an unrecognised key is passed through untouched and left to
+# named-checkconf; the schema exists to turn common typos into a useful message
+# rather than a parser error.
+_OPTION_SCHEMA = {
+  "recursion": ("bool", None),
+  "notify": ("enum", ("yes", "no", "explicit", "master-only", "primary-only")),
+  "stale-answer-enable": ("bool", None),
+  "dnssec-validation": ("enum", ("yes", "no", "auto")),
+  "forward": ("enum", ("first", "only")),
+  "check-names": ("enum", ("warn", "fail", "ignore")),
+  "auth-nxdomain": ("bool", None),
+  "empty-zones-enable": ("bool", None),
+  "minimal-responses": ("enum", ("yes", "no", "no-auth", "no-auth-recursive")),
+  "directory": ("quoted", None),
+  "dump-file": ("quoted", None),
+  "statistics-file": ("quoted", None),
+  "managed-keys-directory": ("quoted", None),
+  "version": ("quoted", None),
+  "server-id": ("quoted", None),
+  "tcp-clients": ("number", None),
+  "max-cache-size": ("size", None),
+  "max-cache-ttl": ("duration", None),
+  "lame-ttl": ("duration", None),
+}
+
+
+def lint_named_conf(content):
+  """Check a buffer without writing it: schema first, then named-checkconf.
+
+  This runs against a temporary copy so the editor can report problems with
+  line numbers before anything touches the live file.
+  """
+  problems = _lint_named_conf(content)
+  with tempfile.NamedTemporaryFile('w', suffix='.conf', delete=False) as tmp:
+    tmp.write(content)
+    tmp_path = tmp.name
+  try:
+    ok, msg = bindctl.check_conf(tmp_path)
+  finally:
+    Path(tmp_path).unlink(missing_ok=True)
+  # checkconf reports the temporary path; the editor only cares about the line.
+  msg = msg.replace(tmp_path, "named.conf")
+  return {"schema": problems, "checkconfOk": ok, "checkconf": msg}
+
+
+def _lint_named_conf(content):
+  """Advisory checks against the option schema. Returns a list of messages."""
+  problems = []
+  simple = re.compile(r'^\s*([a-z][a-z0-9-]*)\s+([^;{}]+);\s*(?:#.*)?$', re.IGNORECASE)
+
+  for lineno, raw in enumerate(content.splitlines(), start=1):
+    line = raw.split('#')[0].split('//')[0]
+    if not line.strip():
+      continue
+    m = simple.match(line)
+    if not m:
+      continue
+    key, value = m.group(1).lower(), m.group(2).strip()
+    if key not in _OPTION_SCHEMA:
+      continue
+
+    kind, allowed = _OPTION_SCHEMA[key]
+    bad = None
+    if kind == "bool" and value.lower() not in ("yes", "no"):
+      bad = "expected yes or no"
+    elif kind == "enum" and value.lower() not in allowed:
+      bad = f"expected one of {', '.join(allowed)}"
+    elif kind == "quoted" and not (value.startswith('"') and value.endswith('"')):
+      bad = "expected a quoted string"
+    elif kind == "number" and not value.isdigit():
+      bad = "expected a number"
+    elif kind == "duration" and not re.fullmatch(r'\d+[smhdw]?', value, re.IGNORECASE):
+      bad = "expected a number, optionally suffixed with s, m, h, d or w"
+    elif kind == "size" and not re.fullmatch(r'(\d+[kmg]?|unlimited|default)', value,
+                                             re.IGNORECASE):
+      bad = "expected a size such as 256m, or unlimited"
+
+    if bad:
+      problems.append(f"line {lineno}: {key} {value} -- {bad}")
+
+  return problems
+
+
+# ---------------------------------------------------------------------------
+# Logging
+#
+# Output goes to syslog only. On a real deployment these records are either
+# forwarded to something like Splunk or kept by the local journal, and neither
+# needs BIND managing its own log files, rotation and disk budget. Dropping file
+# channels removes the whole versions/size surface along with them.
+# ---------------------------------------------------------------------------
+
+_LOG_CATEGORIES = [
+  ("default", "Anything without a category of its own"),
+  ("general", "Messages that fit nowhere more specific"),
+  ("queries", "Every query received. High volume."),
+  ("query-errors", "Queries that could not be answered"),
+  ("security", "Approved and denied requests"),
+  ("xfer-in", "Zone transfers this server receives"),
+  ("xfer-out", "Zone transfers this server sends"),
+  ("update", "Dynamic update requests"),
+  ("update-security", "Approved and denied update requests"),
+  ("notify", "NOTIFY messages"),
+  ("client", "Client activity"),
+  ("lame-servers", "Misconfigured remote servers. Often noise."),
+  ("dnssec", "DNSSEC validation"),
+  ("resolver", "Recursive resolution"),
+  ("network", "Network operations"),
+  ("config", "Configuration file parsing and processing"),
+  ("rate-limit", "Rate limiting activity"),
+]
+
+_LOG_SEVERITIES = ["critical", "error", "warning", "notice", "info", "debug"]
+_LOG_FACILITIES = ["daemon", "local0", "local1", "local2", "local3",
+                   "local4", "local5", "local6", "local7"]
+
+# Channels this plugin generates are named predictably so they can be told
+# apart from anything hand-written.
+_LOG_CHANNEL_PREFIX = "cockpit_syslog_"
+
+
+def _find_logging_block(content):
+  """Return (start, end) of the top-level logging block, or None."""
+  for m in re.finditer(r'^\s*logging\s*\{', content, re.MULTILINE):
+    brace = content.index('{', m.start())
+    _, end = _extract_block(content, brace)
+    return m.start(), end
+  return None
+
+
+def read_logging():
+  """Current logging settings, and whether they are ones we can represent."""
+  if not Path(NAMED_CONF).exists():
+    return {"error": "named.conf not found"}
+
+  with open(NAMED_CONF, 'r') as f:
+    content = f.read()
+
+  span = _find_logging_block(content)
+  if not span:
+    return {"success": True, "enabled": False, "facility": "daemon",
+            "categories": {}, "managed": True,
+            "available": _LOG_CATEGORIES, "severities": _LOG_SEVERITIES,
+            "facilities": _LOG_FACILITIES}
+
+  body = content[span[0]:span[1]]
+
+  # Map channel name -> severity, for the channels we generated.
+  channels = {}
+  facility = "daemon"
+  foreign_channel = False
+  for cm in re.finditer(r'channel\s+"?([A-Za-z0-9_.-]+)"?\s*\{', body):
+    cname = cm.group(1)
+    cbody, _ = _extract_block(body, body.index('{', cm.start()))
+    sev = re.search(r'severity\s+([A-Za-z]+)\s*;', cbody)
+    fac = re.search(r'syslog\s+([A-Za-z0-9]+)\s*;', cbody)
+    if fac:
+      facility = fac.group(1)
+    if cname.startswith(_LOG_CHANNEL_PREFIX) and sev:
+      channels[cname] = sev.group(1).lower()
+    else:
+      # A file channel, or one someone wrote by hand.
+      foreign_channel = True
+
+  categories = {}
+  for gm in re.finditer(r'category\s+"?([A-Za-z0-9_.-]+)"?\s*\{([^}]*)\}', body):
+    cat = gm.group(1)
+    targets = [t.strip() for t in gm.group(2).split(';') if t.strip()]
+    known = [channels[t] for t in targets if t in channels]
+    if len(targets) == 1 and known:
+      categories[cat] = known[0]
+    else:
+      foreign_channel = True
+
+  return {"success": True, "enabled": True, "facility": facility,
+          "categories": categories, "managed": not foreign_channel,
+          "available": _LOG_CATEGORIES, "severities": _LOG_SEVERITIES,
+          "facilities": _LOG_FACILITIES,
+          "raw": body if foreign_channel else ""}
+
+
+def write_logging(settings):
+  """Replace the logging block with one built from the given settings."""
+  enabled = bool(settings.get("enabled"))
+  facility = settings.get("facility", "daemon")
+  categories = settings.get("categories") or {}
+
+  if facility not in _LOG_FACILITIES:
+    return {"error": f"{facility} is not a syslog facility this page manages"}
+
+  known_cats = {c for c, _ in _LOG_CATEGORIES}
+  for cat, sev in categories.items():
+    if cat not in known_cats:
+      return {"error": f"{cat} is not a logging category this page manages"}
+    if sev not in _LOG_SEVERITIES:
+      return {"error": f"{sev} is not a valid severity"}
+
+  if enabled and categories:
+    used = sorted(set(categories.values()))
+    lines = ["logging {"]
+    for sev in used:
+      lines.append(f"\tchannel {_LOG_CHANNEL_PREFIX}{sev} {{")
+      lines.append(f"\t\tsyslog {facility};")
+      lines.append(f"\t\tseverity {sev};")
+      lines.append("\t\tprint-category yes;")
+      lines.append("\t\tprint-severity yes;")
+      lines.append("\t};")
+    for cat in sorted(categories):
+      lines.append(f"\tcategory {cat} {{ {_LOG_CHANNEL_PREFIX}{categories[cat]}; }};")
+    lines.append("};")
+    new_block = "\n".join(lines) + "\n"
+  else:
+    # Removing the block restores BIND's built-in defaults.
+    new_block = ""
+
+  with open(NAMED_CONF, 'r') as f:
+    content = f.read()
+
+  span = _find_logging_block(content)
+  if span:
+    tail = content[span[1]:]
+    trimmed = tail.lstrip(';')
+    updated = content[:span[0]] + new_block + trimmed
+  elif new_block:
+    updated = content.rstrip('\n') + "\n\n" + new_block
+  else:
+    return {"success": True, "unchanged": True}
+
+  backup = bindctl.snapshot(NAMED_CONF)
+  with open(NAMED_CONF, 'w') as f:
+    f.write(updated)
+
+  err = bindctl.verify_conf_or_restore(backup, NAMED_CONF)
+  if err:
+    return {"error": err}
+
+  return {"success": True, "reload": bindctl.reconfig()}
+
+
 def main():
   if len(sys.argv) < 2:
     print(json.dumps({"error": "No command provided"}))
@@ -1368,6 +2060,31 @@ def main():
     zone_name = data.pop('zone')
     result = update_soa(zone_name, data)
     print(json.dumps(result))
+
+  elif command == "read-logging":
+    print(json.dumps(read_logging()))
+
+  elif command == "write-logging" and len(sys.argv) >= 3:
+    print(json.dumps(write_logging(json.loads(sys.argv[2]))))
+
+  elif command == "read-named-conf":
+    print(json.dumps(read_named_conf()))
+
+  elif command == "lint-named-conf":
+    print(json.dumps(lint_named_conf(_read_stdin())))
+
+  elif command == "write-named-conf":
+    print(json.dumps(write_named_conf(_read_stdin())))
+
+  elif command == "import-parse-conf":
+    print(json.dumps(import_parse_conf(_read_stdin())))
+
+  elif command == "import-validate-zone" and len(sys.argv) >= 3:
+    print(json.dumps(import_validate_zone(sys.argv[2], _read_stdin())))
+
+  elif command == "import-zone" and len(sys.argv) >= 3:
+    meta = json.loads(sys.argv[2])
+    print(json.dumps(import_zone(meta, _read_stdin())))
 
   else:
     print(json.dumps({"error": f"Unknown command: {command}"}))

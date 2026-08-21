@@ -38,6 +38,11 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
   const [recordType, setRecordType] = useState('A');
   const [recordValue, setRecordValue] = useState('');
   const [createPtr, setCreatePtr] = useState(true);
+  // SRV and CAA rdata has several fields; the form collects them separately and
+  // assembles the value, so nobody has to remember the token order.
+  const [srv, setSrv] = useState({ service: '', proto: 'tcp', priority: '0',
+    weight: '0', port: '', target: '' });
+  const [caa, setCaa] = useState({ flags: '0', tag: 'issue', otherTag: '', value: '' });
 
   // Records table sorting
   const [recordSortField, setRecordSortField] = useState('name');
@@ -51,6 +56,7 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
   const [aclLocalhost, setAclLocalhost] = useState(false);
   const [aclLocalnets, setAclLocalnets] = useState(false);
   const [tsigKeys, setTsigKeys] = useState([]);
+  const [thawFailure, setThawFailure] = useState(null);
 
   // Inline MX record state
   const [mxAddress, setMxAddress] = useState('');
@@ -167,20 +173,47 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
     setRecordType('A');
     setRecordValue('');
     setCreatePtr(true);
+    setSrv({ service: '', proto: 'tcp', priority: '0', weight: '0', port: '', target: '' });
+    setCaa({ flags: '0', tag: 'issue', otherTag: '', value: '' });
     setIsRecordModalOpen(true);
   };
 
   const handleEditRecord = (record) => {
     setEditingRecord(record);
-    setRecordName(record.name);
     setRecordType(record.type);
     setRecordValue(record.value);
+    setRecordName(record.name);
+
+    // SRV and CAA are edited through their structured fields, so decompose the
+    // stored rdata back into them rather than showing a raw string.
+    if (record.type === 'SRV') {
+      const [priority = '0', weight = '0', port = '', target = ''] = record.value.split(/\s+/);
+      setSrv({ ...srv, priority, weight, port, target });
+      // Owner is _service._proto[.rest]; split it back apart.
+      const m = /^_([^.]+)\._([^.]+)\.?(.*)$/.exec(record.name);
+      if (m) {
+        setSrv({ service: m[1], proto: m[2], priority, weight, port, target });
+        setRecordName(m[3] || '');
+      }
+    } else if (record.type === 'CAA') {
+      const m = /^(\d+)\s+(\S+)\s+"?(.*?)"?$/.exec(record.value.trim());
+      if (m) {
+        const known = ['issue', 'issuewild', 'iodef'].includes(m[2]);
+        setCaa({ flags: m[1], tag: known ? m[2] : 'other',
+          otherTag: known ? '' : m[2], value: m[3] });
+      }
+    }
     setIsRecordModalOpen(true);
   };
 
   // Any write returns a `reload` block; surface it when it did not apply
   // cleanly, plus any validation warning the backend attached.
   const noteWriteResult = (result) => {
+    // A zone left frozen refuses dynamic updates until someone thaws it, and
+    // nothing else in the system will point at this plugin as the cause.
+    if (result && result.thawFailed) {
+      setThawFailure(result.thawFailed);
+    }
     const notice = reloadNotice(result);
     if (result && result.warning) {
       setError(result.warning);
@@ -295,8 +328,34 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
     }
   };
 
+  const srvOwner = () => {
+    const prefix = `_${srv.service.trim()}._${srv.proto}`;
+    const rest = recordName.trim();
+    return rest && rest !== '@' ? `${prefix}.${rest}` : prefix;
+  };
+  const srvValue = () =>
+    `${srv.priority || 0} ${srv.weight || 0} ${srv.port} ${srv.target}`.trim();
+  const caaTag = () => (caa.tag === 'other' ? caa.otherTag.trim() : caa.tag);
+  const caaValue = () => `${caa.flags || 0} ${caaTag()} "${caa.value}"`;
+
   const handleSaveRecord = async () => {
-    if (!recordName.trim() || !recordValue.trim()) {
+    // SRV and CAA build their name and value from the structured fields.
+    const isSrv = recordType === 'SRV';
+    const isCaa = recordType === 'CAA';
+    const effectiveName = isSrv ? srvOwner()
+      : isCaa ? (recordName.trim() || '@')
+        : recordName;
+    const effectiveValue = isSrv ? srvValue() : isCaa ? caaValue() : recordValue;
+
+    if (isSrv && (!srv.service.trim() || !srv.port.trim() || !srv.target.trim())) {
+      alert('SRV records need a service, port and target');
+      return;
+    }
+    if (isCaa && (!caaTag() || !caa.value.trim())) {
+      alert('CAA records need a tag and a value');
+      return;
+    }
+    if (!isSrv && !isCaa && (!recordName.trim() || !recordValue.trim())) {
       alert('Please fill in all fields');
       return;
     }
@@ -307,9 +366,9 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
           zone: zone.name,
           oldName: editingRecord.name,
           oldValue: editingRecord.value,
-          name: recordName,
+          name: effectiveName,
           type: recordType,
-          value: recordValue
+          value: effectiveValue
         };
         const output = await spawnBackend(['update-record', JSON.stringify(data)]);
         const result = JSON.parse(output);
@@ -321,9 +380,9 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
       } else {
         const data = {
           zone: zone.name,
-          name: recordName,
+          name: effectiveName,
           type: recordType,
-          value: recordValue,
+          value: effectiveValue,
           createReverse: (recordType === 'A' || recordType === 'AAAA') ? createPtr : false
         };
         const output = await spawnBackend(['add-record', JSON.stringify(data)]);
@@ -635,6 +694,32 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
         </BreadcrumbItem>
         <BreadcrumbItem isActive>{zone.name}</BreadcrumbItem>
       </Breadcrumb>
+
+      {thawFailure && (
+        <Alert
+          variant="danger"
+          isInline
+          title="This zone is frozen and dynamic updates are being refused"
+          style={{ marginBottom: '1rem' }}
+        >
+          <p style={{ fontWeight: 'bold' }}>{thawFailure}</p>
+        </Alert>
+      )}
+
+      {zone && zone.dynamic && (
+        <Alert
+          variant="warning"
+          isInline
+          title="This zone accepts dynamic updates"
+          style={{ marginBottom: '1rem' }}
+        >
+          <p>
+            Anything holding the zone&apos;s TSIG key can add and remove records here,
+            so what is on screen may not stay current. Edits made from this page are
+            coordinated with the server automatically, so they will not be lost.
+          </p>
+        </Alert>
+      )}
 
       {error && (
         <Alert
@@ -1038,15 +1123,22 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
       >
         <ModalBody>
           <Form>
-            <FormGroup label="Record Name" isRequired fieldId="record-name">
+            <FormGroup label="Record Name"
+              isRequired={recordType !== 'SRV' && recordType !== 'CAA'}
+              fieldId="record-name">
               <TextInput
-                isRequired
                 type="text"
                 id="record-name"
                 value={recordName}
                 onChange={(event, value) => setRecordName(value)}
-                placeholder="hostname"
+                placeholder={recordType === 'SRV' ? 'leave blank for the zone itself' : 'hostname'}
+                isRequired={recordType !== 'SRV' && recordType !== 'CAA'}
               />
+              {recordType === 'SRV' && (
+                <p style={{ fontSize: '0.875rem', color: '#6a6e73', marginTop: '0.25rem' }}>
+                  Optional. The service and protocol below are prepended to this.
+                </p>
+              )}
             </FormGroup>
             <FormGroup label="Type" isRequired fieldId="record-type">
               <select id="record-type" value={recordType} onChange={(e) => setRecordType(e.target.value)} className="pf-v6-c-form-control">
@@ -1055,18 +1147,109 @@ export const ZoneEditorPage = ({ zone, onBack }) => {
                 <option value="CNAME">CNAME</option>
                 <option value="TXT">TXT</option>
                 <option value="PTR">PTR</option>
+                <option value="SRV">SRV</option>
+                <option value="CAA">CAA</option>
               </select>
             </FormGroup>
-            <FormGroup label="Value" isRequired fieldId="record-value">
-              <TextInput
-                isRequired
-                type="text"
-                id="record-value"
-                value={recordValue}
-                onChange={(event, value) => setRecordValue(value)}
-                placeholder="192.168.1.1"
-              />
-            </FormGroup>
+            {recordType === 'SRV' && (
+              <>
+                <FormGroup label="Service" isRequired fieldId="srv-service">
+                  <TextInput isRequired type="text" id="srv-service" value={srv.service}
+                    onChange={(e, v) => setSrv({ ...srv, service: v })}
+                    placeholder="ldap" />
+                  <p style={{ fontSize: '0.875rem', color: '#6a6e73', marginTop: '0.25rem' }}>
+                    Without the leading underscore; it is added for you.
+                  </p>
+                </FormGroup>
+                <FormGroup label="Protocol" isRequired fieldId="srv-proto">
+                  <select id="srv-proto" className="pf-v6-c-form-control" value={srv.proto}
+                    onChange={(e) => setSrv({ ...srv, proto: e.target.value })}>
+                    <option value="tcp">tcp</option>
+                    <option value="udp">udp</option>
+                    <option value="tls">tls</option>
+                    <option value="sctp">sctp</option>
+                  </select>
+                </FormGroup>
+                <FormGroup label="Priority" fieldId="srv-priority">
+                  <TextInput type="text" id="srv-priority" value={srv.priority}
+                    onChange={(e, v) => setSrv({ ...srv, priority: v })} placeholder="0" />
+                </FormGroup>
+                <FormGroup label="Weight" fieldId="srv-weight">
+                  <TextInput type="text" id="srv-weight" value={srv.weight}
+                    onChange={(e, v) => setSrv({ ...srv, weight: v })} placeholder="0" />
+                </FormGroup>
+                <FormGroup label="Port" isRequired fieldId="srv-port">
+                  <TextInput isRequired type="text" id="srv-port" value={srv.port}
+                    onChange={(e, v) => setSrv({ ...srv, port: v })} placeholder="389" />
+                </FormGroup>
+                <FormGroup label="Target" isRequired fieldId="srv-target">
+                  <TextInput isRequired type="text" id="srv-target" value={srv.target}
+                    onChange={(e, v) => setSrv({ ...srv, target: v })}
+                    placeholder="ldap.example.com." />
+                </FormGroup>
+                <FormGroup fieldId="srv-preview">
+                  <p style={{ fontSize: '0.875rem', color: '#6a6e73' }}>
+                    Will be written as:{' '}
+                    <code>{srvOwner()} IN SRV {srvValue()}</code>
+                  </p>
+                </FormGroup>
+              </>
+            )}
+
+            {recordType === 'CAA' && (
+              <>
+                <FormGroup label="Flags" fieldId="caa-flags">
+                  <TextInput type="text" id="caa-flags" value={caa.flags}
+                    onChange={(e, v) => setCaa({ ...caa, flags: v })} placeholder="0" />
+                  <p style={{ fontSize: '0.875rem', color: '#6a6e73', marginTop: '0.25rem' }}>
+                    0 for normal use. 128 marks the tag critical, so a CA that does not
+                    understand it must refuse to issue.
+                  </p>
+                </FormGroup>
+                <FormGroup label="Tag" isRequired fieldId="caa-tag">
+                  <select id="caa-tag" className="pf-v6-c-form-control" value={caa.tag}
+                    onChange={(e) => setCaa({ ...caa, tag: e.target.value })}>
+                    <option value="issue">issue — CA allowed to issue certificates</option>
+                    <option value="issuewild">issuewild — CA allowed to issue wildcards</option>
+                    <option value="iodef">iodef — where to report violations</option>
+                    <option value="other">other</option>
+                  </select>
+                </FormGroup>
+                {caa.tag === 'other' && (
+                  <FormGroup label="Tag name" isRequired fieldId="caa-other-tag">
+                    <TextInput isRequired type="text" id="caa-other-tag" value={caa.otherTag}
+                      onChange={(e, v) => setCaa({ ...caa, otherTag: v })} />
+                  </FormGroup>
+                )}
+                <FormGroup label="Value" isRequired fieldId="caa-value">
+                  <TextInput isRequired type="text" id="caa-value" value={caa.value}
+                    onChange={(e, v) => setCaa({ ...caa, value: v })}
+                    placeholder={caa.tag === 'iodef' ? 'mailto:security@example.com'
+                      : 'letsencrypt.org'} />
+                  <p style={{ fontSize: '0.875rem', color: '#6a6e73', marginTop: '0.25rem' }}>
+                    Quotes are added for you.
+                  </p>
+                </FormGroup>
+                <FormGroup fieldId="caa-preview">
+                  <p style={{ fontSize: '0.875rem', color: '#6a6e73' }}>
+                    Will be written as: <code>{recordName || '@'} IN CAA {caaValue()}</code>
+                  </p>
+                </FormGroup>
+              </>
+            )}
+
+            {recordType !== 'SRV' && recordType !== 'CAA' && (
+              <FormGroup label="Value" isRequired fieldId="record-value">
+                <TextInput
+                  isRequired
+                  type="text"
+                  id="record-value"
+                  value={recordValue}
+                  onChange={(event, value) => setRecordValue(value)}
+                  placeholder="192.168.1.1"
+                />
+              </FormGroup>
+            )}
             {!editingRecord && (recordType === 'A' || recordType === 'AAAA') && (
               <FormGroup fieldId="record-create-ptr">
                 <Checkbox

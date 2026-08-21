@@ -10,6 +10,8 @@ import { ZonesPage } from './components/ZonesPage';
 import { TsigKeysPage } from './components/TsigKeysPage';
 import { AclsPage } from './components/AclsPage';
 import { ForwardersPage } from './components/ForwardersPage';
+import { BackupsPage } from './components/BackupsPage';
+import { LoggingPage } from './components/LoggingPage';
 
 export const Application = () => {
   const [activeTabKey, setActiveTabKey] = React.useState(0);
@@ -64,6 +66,22 @@ export const Application = () => {
         aria-label="TSIG Keys"
       >
         <TsigKeysPage />
+      </Tab>
+
+      <Tab
+        eventKey={4}
+        title={<TabTitleText>Logging</TabTitleText>}
+        aria-label="Logging"
+      >
+        <LoggingPage />
+      </Tab>
+
+      <Tab
+        eventKey={5}
+        title={<TabTitleText>Backups</TabTitleText>}
+        aria-label="Backups"
+      >
+        <BackupsPage />
       </Tab>
     </Tabs>
   );
